@@ -13,6 +13,9 @@ to follow [Semantic Versioning](https://semver.org/) once it reaches 1.0.
 - Commands: `init`, `enroll`, `daemon`, `edge`, `stop`, `status`, `doctor`,
   `backup` / `restore` / `backup-inspect`, plus hidden `shell`, `destroy`,
   `native-host`, and `sso-test`.
+- Multiple install paths: a static musl binary attached to each GitHub Release
+  (`curl | sh` via `install.sh`), `cargo install intune-container`, or from
+  source with `just install`.
 - **Headless by default** — the container has no access to your screen; the real
   display and GPU are forwarded only for the interactive `enroll` and `edge`
   flows. Background SSO runs against a private in-container `Xvfb`.

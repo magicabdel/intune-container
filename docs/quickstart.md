@@ -2,9 +2,31 @@
 
 ## 1. Install
 
-```sh
-just install      # builds and installs to ~/.local/bin (no sudo)
-```
+Pick one:
+
+=== "Prebuilt binary"
+
+    Static Linux x86_64 binary from the latest GitHub Release, into `~/.local/bin`:
+
+    ```sh
+    curl -fsSL https://raw.githubusercontent.com/magicabdel/intune-container/master/install.sh | sh
+    # or: wget -qO- https://raw.githubusercontent.com/magicabdel/intune-container/master/install.sh | sh
+    ```
+
+    Override the location with `DEST=/usr/local/bin`, or pin a version with
+    `VERSION=v0.2.0`.
+
+=== "cargo"
+
+    ```sh
+    cargo install intune-container
+    ```
+
+=== "From source"
+
+    ```sh
+    just install      # builds and installs to ~/.local/bin (no sudo)
+    ```
 
 Make sure `~/.local/bin` is on your `PATH`. The default container image is
 publicly hosted and already includes everything needed (including `Xvfb` for

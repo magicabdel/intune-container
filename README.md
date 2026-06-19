@@ -15,9 +15,9 @@ The banner lives at docs/assets/hero.jpg.
 
 <p align="center">
   📖 <a href="https://magicabdel.github.io/intune-container/"><b>Documentation</b></a>
-  · <a href="docs/quickstart.md">Quickstart</a>
-  · <a href="docs/architecture.md">Architecture</a>
-  · <a href="docs/roadmap.md">Roadmap</a>
+  · <a href="https://magicabdel.github.io/intune-container/quickstart/">Quickstart</a>
+  · <a href="https://magicabdel.github.io/intune-container/architecture/">Architecture</a>
+  · <a href="https://magicabdel.github.io/intune-container/roadmap/">Roadmap</a>
 </p>
 
 ---
@@ -32,8 +32,19 @@ Hyprland, Sway, GNOME, KDE) and X11.
 ## Quick start
 
 ```sh
-just install            # build + install to ~/.local/bin (no sudo)
+# Prebuilt binary (Linux x86_64) — installs to ~/.local/bin
+curl -fsSL https://raw.githubusercontent.com/magicabdel/intune-container/master/install.sh | sh
 
+# ...or from crates.io
+cargo install intune-container
+
+# ...or from source
+just install
+```
+
+Then:
+
+```sh
 intune-container enroll # set up + enroll your device (opens the portal)
 intune-container daemon # (optional) seamless Teams/M365 SSO in your browser
 ```
