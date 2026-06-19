@@ -1,0 +1,61 @@
+# git-cliff configuration — generates CHANGELOG.md from Conventional Commits.
+# https://git-cliff.org
+#
+# Usage (see the `changelog*` recipes in the justfile):
+#   git cliff --output CHANGELOG.md                 # full history
+#   git cliff --unreleased --tag v0.2.0 --prepend CHANGELOG.md   # next release
+#
+# Commit messages drive the sections, e.g.:
+#   feat: add private-network mode      -> "Added"
+#   fix: portal blank on cold boot       -> "Fixed"
+#   docs: write mkdocs site              -> "Documentation"
+
+[changelog]
+header = """
+# Changelog
+
+All notable changes to this project are documented here. The format is based on
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims
+to follow [Semantic Versioning](https://semver.org/) once it reaches 1.0.
+\n
+"""
+body = """
+{% if version %}\
+## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+{% else %}\
+## [Unreleased]
+{% endif %}\
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | upper_first }}
+{% for commit in commits %}\
+- {{ commit.message | upper_first }}\
+{% if commit.breaking %} **(breaking)**{% endif %}
+{% endfor %}\
+{% endfor %}\n
+"""
+trim = true
+
+[git]
+conventional_commits = true
+filter_unconventional = true
+split_commits = false
+# Conventional Commit type -> changelog section. Keep a Changelog vocabulary.
+commit_parsers = [
+  { message = "^feat", group = "Added" },
+  { message = "^fix", group = "Fixed" },
+  { message = "^perf", group = "Changed" },
+  { message = "^refactor", group = "Changed" },
+  { message = "^doc", group = "Documentation" },
+  { message = "^sec", group = "Security" },
+  { message = "^revert", group = "Changed" },
+  { message = "^chore\\(release\\):", skip = true },
+  { message = "^chore", skip = true },
+  { message = "^test", skip = true },
+  { message = "^ci", skip = true },
+  { message = "^build", skip = true },
+  { message = "^style", skip = true },
+]
+protect_breaking_commits = true
+filter_commits = false
+tag_pattern = "v[0-9]*"
+sort_commits = "oldest"
