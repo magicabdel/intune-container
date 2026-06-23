@@ -1,0 +1,36 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#3b6fe0"/>
+      <stop offset="1" stop-color="#1f3a8a"/>
+    </linearGradient>
+    <linearGradient id="face" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#dbe6ff"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="0" y="0" width="1024" height="1024" rx="220" fill="url(#bg)"/>
+
+  <!-- Isometric container/cube -->
+  <g transform="translate(512 512)">
+    <!-- top face -->
+    <path d="M0 -250 L250 -125 L0 0 L-250 -125 Z" fill="url(#face)"/>
+    <!-- left face -->
+    <path d="M-250 -125 L0 0 L0 270 L-250 145 Z" fill="#9fb8f2"/>
+    <!-- right face -->
+    <path d="M250 -125 L0 0 L0 270 L250 145 Z" fill="#c4d4f8"/>
+    <!-- subtle edge highlight -->
+    <path d="M0 -250 L250 -125 L0 0 L-250 -125 Z" fill="none" stroke="#ffffff" stroke-width="6" stroke-linejoin="round" opacity="0.6"/>
+  </g>
+
+  <!-- Lock badge: isolation / SSO -->
+  <g transform="translate(660 660)">
+    <circle cx="0" cy="0" r="150" fill="#1f3a8a"/>
+    <circle cx="0" cy="0" r="150" fill="none" stroke="#ffffff" stroke-width="10" opacity="0.35"/>
+    <path d="M-42 -10 a42 42 0 0 1 84 0 v18 h-26 v-18 a16 16 0 0 0 -32 0 v18 h-26 Z" fill="#ffffff"/>
+    <rect x="-58" y="6" width="116" height="86" rx="16" fill="#ffffff"/>
+    <circle cx="0" cy="44" r="14" fill="#1f3a8a"/>
+    <rect x="-7" y="48" width="14" height="28" rx="7" fill="#1f3a8a"/>
+  </g>
+</svg>

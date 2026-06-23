@@ -2,7 +2,7 @@
 name = "intune-container"
 version = "0.1.0"
 edition = "2021"
-description = "CLI tool for managing Microsoft Intune in a systemd-nspawn container"
+description = "Manage Microsoft Intune in a systemd-nspawn container (GUI + CLI in one binary)"
 license = "MIT"
 readme = "README.md"
 keywords = ["intune", "systemd-nspawn", "sso", "entra", "linux"]
@@ -10,28 +10,54 @@ categories = ["command-line-utilities"]
 authors = ["Abdessalam ZAIMI <abdessalam@zaimi.dev>"]
 repository = "https://github.com/magicabdel/intune-container"
 
+# One package, two targets: a library with all the logic, and a single binary
+# that is both the graphical interface (default) and the command-line tool.
+[lib]
+name = "intune_container"
+path = "src/lib.rs"
+
+[[bin]]
+name = "intune-container"
+path = "src/main.rs"
+
+[build-dependencies]
+# Processes tauri.conf.json + the capability schemas for the GUI.
+tauri-build = { version = "2", features = [] }
+
+[features]
+default = []
+
 [dependencies]
-# CLI parsing
-clap = { version = "4", features = ["derive"] }
-
-# Unix APIs
-nix = { version = "0.29", features = ["process", "signal", "user", "fs"] }
-
-# Error handling
+# --- Core ---
+nix = { version = "0.29", features = ["process", "signal", "user", "fs", "mount", "sched", "hostname"] }
 anyhow = "1"
-
-# Configuration
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
-
-# Logging
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# Password prompt
-rpassword = "7"
 
 # D-Bus (native messaging host → container broker)
 zbus = { version = "4", default-features = false, features = ["tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "time"] }
+
+# HTTP client for the SSO device-status check (Microsoft Graph). rustls with
+# bundled roots so it works inside the minimal container too (no system CA / curl).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# --- CLI front-end ---
+clap = { version = "4", features = ["derive"] }
+rpassword = "7"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# --- GUI front-end (Tauri) ---
+# `tray-icon` gives the system-tray indicator; `image-png` embeds/loads the icon.
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+# Native file open/save dialogs (backup destination / restore source).
+tauri-plugin-dialog = "2"
+
+# --- Rootless runtime ---
+# Pull OCI images without docker/podman, and extract layers without `tar`.
+oci-client = { version = "0.14", default-features = false, features = ["rustls-tls"] }
+tar = "0.4"
+flate2 = "1"
+zstd = "0.13"

@@ -4,6 +4,25 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims
 to follow [Semantic Versioning](https://semver.org/) once it reaches 1.0.
 
+## [Unreleased]
+
+### Added
+
+- **No-restart display attach**: when a GUI flow (`enroll`/`edge`) needs the
+  host display and the container is already running headless, the display,
+  audio, and GPU are bound into the running machine via `machinectl bind`
+  instead of restarting it — so a background `daemon` SSO session is no longer
+  torn down. The display is automatically detached (unmounted) again when the
+  GUI app exits, returning the container to headless isolation. New hidden
+  `detach-display` command for manual detach.
+- **System tray** (`ksni`/StatusNotifierItem, no GTK on the host): launched
+  automatically whenever the container starts, it shows running/headless/SSO
+  status and offers Open Edge, Open Portal, doctor, backup/restore, and
+  *Quit & stop container*. The tray exits on its own when the container stops;
+  quitting it via *Quit & stop* stops the container. Single-instance via a lock;
+  if no StatusNotifier host is available it logs a warning and exits without
+  affecting the container.
+
 ## [0.1.0] - 2026-06-19
 
 ### Added

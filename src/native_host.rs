@@ -315,7 +315,7 @@ async fn test(bus_socket: &Path) -> Result<()> {
                         Some(device_id) => {
                             println!("  ✓ Graph token carries deviceid={device_id}");
                             println!("    The device IS Entra-registered (Workplace Join OK).");
-                            report_device_query(token, device_id);
+                            report_device_query(token, device_id).await;
                         }
                     },
                 },
@@ -333,39 +333,43 @@ async fn test(bus_socket: &Path) -> Result<()> {
 /// Replicate the final step of the extension's device check: query Microsoft
 /// Graph for the device object (compliance + display name), using the same
 /// Graph token. Reports the exact HTTP outcome so the user can tell whether
-/// "Device unknown" is a tenant permission issue (403) rather than a bug.
-fn report_device_query(token: &str, device_id: &str) {
-    use std::process::Command;
-
+/// "Device unknown" is a tenant permission issue (403) or a sync delay (404)
+/// rather than a bug. Uses an in-process HTTPS client so it works inside the
+/// minimal container (no `curl`).
+async fn report_device_query(token: &str, device_id: &str) {
     let url = format!(
         "https://graph.microsoft.com/v1.0/devices(deviceId='{{{device_id}}}')?$select=isCompliant,displayName"
     );
-    let output = Command::new("curl")
-        .arg("-s")
-        .arg("-w")
-        .arg("\n%{http_code}")
-        .arg("-H")
-        .arg("Accept: application/json")
-        .arg("-H")
-        .arg(format!("Authorization: Bearer {token}"))
-        .arg(&url)
-        .output();
-
-    let output = match output {
-        Ok(o) => o,
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+    {
+        Ok(c) => c,
         Err(e) => {
-            println!("    (could not run curl to verify Graph query: {e})");
+            println!("    (could not build HTTP client to verify Graph query: {e})");
             return;
         }
     };
+    let resp = client
+        .get(&url)
+        .header("Accept", "application/json")
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await;
 
-    let combined = String::from_utf8_lossy(&output.stdout);
-    let (body, status) = combined.rsplit_once('\n').unwrap_or(("", combined.trim()));
-    let body = body.trim();
+    let resp = match resp {
+        Ok(r) => r,
+        Err(e) => {
+            println!("    (could not reach Microsoft Graph to verify: {e})");
+            return;
+        }
+    };
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap_or_default();
 
-    match status.trim() {
-        "200" => {
-            let parsed: Option<Value> = serde_json::from_str(body).ok();
+    match status {
+        200 => {
+            let parsed: Option<Value> = serde_json::from_str(&body).ok();
             let name = parsed
                 .as_ref()
                 .and_then(|v| v.get("displayName"))
@@ -379,17 +383,17 @@ fn report_device_query(token: &str, device_id: &str) {
             println!("    The extension SHOULD show a real device status (not 'unknown').");
             println!("    If it still says 'unknown', reopen the popup to force a refresh.");
         }
-        "403" => {
+        403 => {
             println!("  ! Graph /devices query returned 403 Forbidden.");
             println!("    → THIS is why the extension shows 'Device unknown'. Your account");
             println!("      isn't allowed to read device objects from the directory (a tenant");
             println!("      policy). It is purely cosmetic: the device is registered and SSO");
             println!("      works. Nothing to fix on this machine.");
         }
-        "404" => {
+        404 => {
             println!("  ! Graph /devices query returned 404 (device object not found).");
             println!("    → The deviceid isn't visible in the directory yet. Usually resolves");
-            println!("      after the device fully syncs; SSO is unaffected.");
+            println!("      after the device fully syncs; SSO is unaffected. Re-check later.");
         }
         other => {
             println!("  ! Graph /devices query returned HTTP {other}.");

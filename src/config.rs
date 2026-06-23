@@ -11,10 +11,10 @@ use tracing::debug;
 /// Primary configuration for the intune container.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    /// Name of the systemd-nspawn machine (used with machinectl)
+    /// Display name for the container.
     pub machine_name: String,
 
-    /// Path to the container root filesystem
+    /// Path to the container root filesystem (user-writable; under the data dir).
     pub rootfs_path: PathBuf,
 
     /// UID of the host user (mapped into the container)
@@ -49,34 +49,13 @@ impl Default for Config {
 
         Self {
             machine_name: "intune".to_string(),
-            rootfs_path: PathBuf::from("/var/lib/machines/intune"),
+            rootfs_path: default_rootfs_path(),
             host_uid: uid,
             host_user: user,
             expose_bus: false,
             display_forwarding: false,
             initialized: false,
         }
-    }
-}
-
-impl Config {
-    /// Path where the container's session bus socket is exposed on the host
-    /// (when broker_proxy is enabled). The container bind-mounts its runtime
-    /// dir here so the host proxy can reach the broker.
-    pub fn broker_bus_path(&self) -> Result<PathBuf> {
-        Ok(data_dir()?
-            .join("intune-container")
-            .join("container-runtime")
-            .join("bus"))
-    }
-
-    /// Host directory bind-mounted to the container's /run/user/<uid>.
-    pub fn broker_runtime_dir(&self) -> Result<PathBuf> {
-        Ok(self
-            .broker_bus_path()?
-            .parent()
-            .expect("bus path always has a parent")
-            .to_path_buf())
     }
 }
 
@@ -174,6 +153,15 @@ fn data_dir() -> Result<PathBuf> {
         .map(PathBuf::from)
         .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".local/share")))
         .context("cannot determine data directory: neither $XDG_DATA_HOME nor $HOME is set")
+}
+
+/// Default rootfs location: the user-writable `…/intune-container/rootfs` under
+/// the data dir (rootless needs no `/var/lib` root-owned path). Best-effort;
+/// falls back to a relative path only when no home/data dir is resolvable.
+fn default_rootfs_path() -> PathBuf {
+    data_dir()
+        .map(|d| d.join("intune-container").join("rootfs"))
+        .unwrap_or_else(|_| PathBuf::from("intune-container-rootfs"))
 }
 
 /// A name safe to interpolate into shell scripts / sudoers: non-empty, ≤64

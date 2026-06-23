@@ -58,3 +58,41 @@ fn lock_path() -> Result<PathBuf> {
         .context("Neither XDG_DATA_HOME nor HOME is set")?;
     Ok(data_dir.join("intune-container").join("lifecycle.lock"))
 }
+
+/// A held single-instance lock for a background helper (currently the tray).
+///
+/// Unlike [`LifecycleLock`], this is acquired non-blocking and held for the
+/// whole lifetime of the holding process: if another instance already holds it,
+/// [`SingletonLock::try_acquire`] returns `Ok(None)` so the caller can exit
+/// quietly instead of running a duplicate.
+pub struct SingletonLock {
+    _flock: Flock<File>,
+}
+
+impl SingletonLock {
+    /// Try to acquire the named singleton lock without blocking. Returns
+    /// `Ok(None)` if another process already holds it.
+    pub fn try_acquire(name: &str) -> Result<Option<Self>> {
+        let path = singleton_lock_path(name)?;
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let file = File::create(&path)
+            .with_context(|| format!("Failed to open lock file {}", path.display()))?;
+
+        match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+            Ok(flock) => Ok(Some(Self { _flock: flock })),
+            Err(_) => Ok(None),
+        }
+    }
+}
+
+fn singleton_lock_path(name: &str) -> Result<PathBuf> {
+    let data_dir = std::env::var("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|_| std::env::var("HOME").map(|home| PathBuf::from(home).join(".local/share")))
+        .context("Neither XDG_DATA_HOME nor HOME is set")?;
+    Ok(data_dir
+        .join("intune-container")
+        .join(format!("{name}.lock")))
+}

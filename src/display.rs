@@ -340,6 +340,72 @@ fn rand_nibble() -> u8 {
     buf[0] & 0x0f
 }
 
+// ===== Rootless backend: bind/env plan =====
+
+/// Where in the container a forwarded display artifact should live, plus the
+/// environment variable that points the GUI app at it.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DisplayAttach {
+    /// `(host_path, container_path)` bind mounts to inject before launching.
+    pub binds: Vec<(PathBuf, PathBuf)>,
+    /// `(name, value)` environment variables to set on the launched process.
+    pub env: Vec<(String, String)>,
+}
+
+impl DisplayInfo {
+    /// Translate detected host display info into the bind mounts and environment
+    /// the rootless backend needs to show a GUI app from inside the container.
+    ///
+    /// The container shares the host network namespace, so abstract X11 sockets
+    /// and TCP displays work with no bind — only the Wayland unix socket, the
+    /// file-based X11 socket dir, and the Xauthority file need to be mounted in.
+    pub fn attach_plan(&self, uid: u32) -> DisplayAttach {
+        let mut plan = DisplayAttach::default();
+        let runtime_dir = PathBuf::from(format!("/run/user/{uid}"));
+        plan.env
+            .push(("XDG_RUNTIME_DIR".into(), runtime_dir.display().to_string()));
+
+        if let Some(sock) = &self.wayland_socket {
+            // Bind to a stable path OUTSIDE /run/user/<uid>: the container's
+            // user-runtime-dir service mounts a tmpfs over /run/user/<uid> at
+            // login, which would shadow a socket bound underneath it. Wayland
+            // accepts an absolute WAYLAND_DISPLAY, so point it straight at the
+            // bind target.
+            let target = PathBuf::from("/run/host-wayland");
+            plan.binds.push((sock.clone(), target.clone()));
+            plan.env
+                .push(("WAYLAND_DISPLAY".into(), target.display().to_string()));
+        }
+
+        if let Some(display) = &self.x11_display {
+            plan.env.push(("DISPLAY".into(), display.clone()));
+            // A file-based socket must be bound in; an abstract one rides the
+            // shared host network namespace and needs nothing.
+            if !self.has_abstract_x11 {
+                if let Some(num) = extract_display_number(display) {
+                    let sock = PathBuf::from(format!("/tmp/.X11-unix/X{num}"));
+                    if sock.exists() {
+                        let unix = PathBuf::from("/tmp/.X11-unix");
+                        let bind = (unix.clone(), unix);
+                        if !plan.binds.contains(&bind) {
+                            plan.binds.push(bind);
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(xauth) = &self.xauthority {
+            let target = PathBuf::from("/tmp/.intune-container-xauth");
+            plan.binds.push((xauth.clone(), target.clone()));
+            plan.env
+                .push(("XAUTHORITY".into(), target.display().to_string()));
+        }
+
+        plan
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,5 +418,43 @@ mod tests {
         assert_eq!(extract_display_number(":10.0"), Some(10));
         assert_eq!(extract_display_number("localhost:0"), Some(0));
         assert_eq!(extract_display_number(""), None);
+    }
+
+    #[test]
+    fn attach_plan_wayland_binds_socket_and_sets_env() {
+        let info = DisplayInfo {
+            wayland_socket: Some(PathBuf::from("/run/user/1000/wayland-1")),
+            x11_display: None,
+            xauthority: None,
+            has_abstract_x11: false,
+        };
+        let plan = info.attach_plan(1000);
+        // Bound to a stable path outside /run/user/<uid> (which gets a tmpfs).
+        assert_eq!(
+            plan.binds,
+            vec![(
+                PathBuf::from("/run/user/1000/wayland-1"),
+                PathBuf::from("/run/host-wayland")
+            )]
+        );
+        assert!(plan
+            .env
+            .contains(&("WAYLAND_DISPLAY".into(), "/run/host-wayland".into())));
+        assert!(plan
+            .env
+            .contains(&("XDG_RUNTIME_DIR".into(), "/run/user/1000".into())));
+    }
+
+    #[test]
+    fn attach_plan_abstract_x11_needs_no_bind() {
+        let info = DisplayInfo {
+            wayland_socket: None,
+            x11_display: Some(":1".into()),
+            xauthority: None,
+            has_abstract_x11: true,
+        };
+        let plan = info.attach_plan(1000);
+        assert!(plan.binds.is_empty());
+        assert!(plan.env.contains(&("DISPLAY".into(), ":1".into())));
     }
 }

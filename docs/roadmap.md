@@ -50,9 +50,13 @@ flowchart LR
 
 ## Other planned work
 
-- **No-restart mode switching** via `machinectl bind`: keep one always-headless
-  container and attach the display on demand for `enroll`/`edge`, so launching a
-  GUI flow no longer tears down a running `daemon` SSO session.
+- **No-restart display attach** *(implemented)*: instead of stopping and
+  re-booting the container when a GUI flow needs the display, `enroll`/`edge`
+  bind the host display sockets into the running machine with `machinectl bind`
+  and unmount them again when the app exits. A background `daemon` SSO session
+  stays up across GUI usage. The container is one long-lived, always-headless
+  machine; a system tray (StatusNotifierItem) tracks it and exposes the common
+  actions.
 - **Preflight checks**: verify `systemd-nspawn`, `machinectl`, a container
   engine, `nsenter`, and cgroup v2 up front with a single actionable error.
 - **CI**: lint/test/build on every PR (see the repository workflows).
