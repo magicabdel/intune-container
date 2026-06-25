@@ -6,40 +6,58 @@ to follow [Semantic Versioning](https://semver.org/) once it reaches 1.0.
 
 ## [Unreleased]
 
-### Changed
+## [0.2.0] - 2026-06-25
 
-- Renamed the `daemon` command to **`start`**: starting the container now also
-  makes browser SSO ready (installs the native-messaging host), so "start" means
-  the same thing in the CLI, the window, and the tray.
+### Changed
 
 - **Rootless runtime.** The container now boots inside an unprivileged user
   namespace via a detached supervisor (`fork` + `unshare`, multi-id mapping with
   `newuidmap`/`newgidmap`, a delegated cgroup scope over the user's systemd
   manager, `pivot_root`). Commands enter it with `setns`. **No host root, no
   `sudo`, `systemd-nspawn`, `machinectl`, `nsenter`, Docker, or Podman** — the
-  image is pulled with a built-in OCI client. `destroy` leaves nothing
+  image is pulled with a built-in OCI client, and `destroy` leaves nothing
   privileged behind because nothing privileged is installed.
+- Renamed the `daemon` command to **`start`**: starting the container now also
+  makes browser SSO ready (installs the native-messaging host), so "start" means
+  the same thing in the CLI, the window, and the tray.
 - The browser SSO native-host bridge runs **inside** the container (via `setns`)
-  against the container's own session bus; the host bus is no longer exposed.
+  against the container's own session bus; the host session bus is no longer
+  exposed.
 
 ### Added
 
-- **Reworked graphical interface.** Tabbed Tauri app — Console (containment
-  state, start/stop, portal, Edge, signed-in identity, live health checks),
-  in-app Shell (a real terminal in the container), Backup/restore, Logs, and a
-  conditional Destroy tab. Status-tinted tray icon (grey/teal/amber), single-
-  click quick panel, double-click full window, and a dynamic Start/Stop menu
-  item. A single-instance plugin focuses the existing window instead of opening
-  a duplicate.
-- **Single-container guarantee**: the supervisor holds a process-lifetime
-  singleton lock, so any number of launches share one container.
-- **Hardening (headless profile)**: a private IPC namespace and cgroup memory/
-  task limits on the delegated scope.
-- **Preflight checks**: clear, actionable errors when unprivileged user
+- **Reworked graphical interface** — a tabbed, tray-resident Tauri app:
+    - **Console** — containment state, primary actions (start/stop, open portal,
+      open Edge), the signed-in **identity**, and **live health checks**.
+    - **Shell** — a real interactive terminal inside the container.
+    - **Backup** — back up / restore enrollment.
+    - **Logs** — follow and search the app log.
+    - **Destroy** — shown only when there's something to remove.
+- **System tray** — a status-tinted icon (grey = stopped, teal = running, amber
+  = display attached), single-click quick panel, double-click for the full
+  window, and a menu with Open portal / Open Edge / a dynamic Start–Stop item.
+- **Single instance** — the supervisor holds a process-lifetime lock (one
+  container, ever), and the GUI focuses an existing window instead of opening a
+  duplicate.
+- **Hardened headless profile** — a private IPC namespace and cgroup memory/task
+  limits on the delegated scope.
+- **Preflight checks** — clear, actionable errors when unprivileged user
   namespaces are disabled, no `/etc/subuid` range exists, or cgroup v2 is
   missing.
-- **`just smoke`**: boots a real container in both profiles and `setns`-execs
-  into each — the gate for runtime/namespace changes.
+- **`just smoke`** — boots a real container in both profiles and `setns`-execs
+  into each; the gate for runtime/namespace changes.
+
+### Fixed
+
+- Entering a display-mode container no longer fails with `EPERM`: it is joined to
+  a separate IPC namespace only when it actually has one. This fixes the session
+  setup (keyring unlock + compliance agent) that had silently broken and left the
+  device reporting non-compliant.
+
+### Removed
+
+- The old design's host privileges — the passwordless `sudoers` rule and the
+  setuid `nsenter` helper — are gone with the move to rootless.
 
 ## [0.1.0] - 2026-06-19
 

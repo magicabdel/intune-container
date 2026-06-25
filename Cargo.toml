@@ -1,6 +1,6 @@
 [package]
 name = "intune-container"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Manage Microsoft Intune in an isolated, rootless Linux container (GUI + CLI in one binary)"
 license = "MIT"
