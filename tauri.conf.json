@@ -5,7 +5,7 @@
   "identifier": "dev.zaimi.intunecontainer",
   "build": {
     "frontendDist": "frontend/dist",
-    "beforeBuildCommand": "npm --prefix frontend install && npm --prefix frontend run build"
+    "beforeBuildCommand": "if [ -f package.json ]; then npm install && npm run build; else npm --prefix frontend install && npm --prefix frontend run build; fi"
   },
   "app": {
     "windows": [
