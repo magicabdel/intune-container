@@ -229,11 +229,28 @@ pub fn stop() -> Result<()> {
     Ok(())
 }
 
+/// Start the container headless (no-op if it's already running). Used by the GUI
+/// power toggle; other flows start it implicitly via [`ensure_running`].
+pub fn start() -> Result<()> {
+    let mut config =
+        config::Config::load().context("Not set up yet. Run:  intune-container enroll")?;
+    locked_ensure_running(&mut config, false)
+}
+
 /// Open an interactive shell inside the container (terminal-only).
 pub fn shell() -> Result<()> {
     let mut config = config::Config::load().context("Failed to load configuration")?;
     locked_ensure_running(&mut config, false)?;
     backend::shell(&config).context("Failed to open shell in container")
+}
+
+/// Ensure the container is running and return what the GUI needs to open an
+/// embedded PTY shell inside it.
+pub fn shell_session() -> Result<backend::ShellTarget> {
+    let mut config =
+        config::Config::load().context("Not set up yet. Run:  intune-container enroll")?;
+    locked_ensure_running(&mut config, false)?;
+    backend::shell_target(&config)
 }
 
 /// Detach the host display from the running container (back to headless).

@@ -39,11 +39,11 @@ export const api = {
   edge: () => invoke<void>("edge"),
   daemon: () => invoke<DaemonReport>("daemon"),
   stop: () => invoke<void>("stop"),
+  start: () => invoke<void>("start"),
   detachDisplay: () => invoke<void>("detach_display"),
   backup: (path?: string) => invoke<string>("backup", { path: path ?? null }),
   restore: (path?: string) => invoke<void>("restore", { path: path ?? null }),
   destroy: (purge: boolean) => invoke<void>("destroy", { purge }),
-  openShell: () => invoke<void>("open_shell"),
   readLog: (maxLines: number) => invoke<string>("read_log", { maxLines }),
   clearLog: () => invoke<void>("clear_log"),
   defaultBackupPath: () => invoke<string>("default_backup_path"),
@@ -59,8 +59,20 @@ export function phaseOf(s: StatusReport | null): Phase {
 }
 
 export const PHASE_COPY: Record<Phase, { state: string; isolation: string }> = {
-  unprovisioned: { state: "Not set up", isolation: "No container provisioned" },
-  dormant: { state: "Stopped", isolation: "Container powered off" },
-  sealed: { state: "Running", isolation: "Sealed · headless" },
-  open: { state: "Running", isolation: "Viewport open · display attached" },
+  unprovisioned: {
+    state: "Not set up",
+    isolation: "Provision the container and enroll this device to begin.",
+  },
+  dormant: {
+    state: "Stopped",
+    isolation: "Powered off. Start it to check in with Intune.",
+  },
+  sealed: {
+    state: "Sealed",
+    isolation: "Running headless — isolated from your desktop.",
+  },
+  open: {
+    state: "Viewport open",
+    isolation: "Host display attached. Reseal when you're done.",
+  },
 };

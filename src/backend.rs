@@ -162,6 +162,29 @@ pub fn shell(config: &Config) -> Result<()> {
     Ok(())
 }
 
+/// What an embedded GUI terminal needs to open a PTY shell in the container.
+pub struct ShellTarget {
+    pub leader: i32,
+    pub uid: u32,
+    pub env: Vec<(String, String)>,
+}
+
+/// Resolve what an embedded GUI terminal needs to open a PTY shell: the running
+/// container's leader pid, the in-container uid to run as, and the session
+/// environment (display + HOME/USER, plus a 256-color `TERM`). The container must
+/// already be running — the caller ensures that under the lifecycle lock.
+pub fn shell_target(config: &Config) -> Result<ShellTarget> {
+    let leader = runtime::running_leader()?.context("container is not running")?;
+    let user = cuser(config);
+    let mut env = session_env(&user, &DisplayInfo::detect());
+    env.push(("TERM".into(), "xterm-256color".into()));
+    Ok(ShellTarget {
+        leader,
+        uid: user.uid,
+        env,
+    })
+}
+
 /// Block until the container has booted far enough to launch the portal.
 pub fn wait_until_portal_ready(config: &Config) {
     info!("Waiting for Intune services to be ready...");

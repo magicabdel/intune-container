@@ -22,12 +22,13 @@
 
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, IntoRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
+use nix::pty::{openpty, Winsize};
 use nix::sched::{unshare, CloneFlags};
 use nix::sys::signal::{killpg, Signal};
 use nix::sys::wait::{waitpid, WaitStatus};
@@ -473,6 +474,137 @@ fn shares_namespace(leader: i32, ns: &str) -> bool {
     let ours = std::fs::read_link(format!("/proc/self/ns/{ns}")).ok();
     let theirs = std::fs::read_link(format!("/proc/{leader}/ns/{ns}")).ok();
     ours.is_some() && ours == theirs
+}
+
+/// `setns` the calling process into the container's namespaces, in join order.
+/// Opens every ns fd first (joining the mount ns changes what `/proc/<leader>`
+/// resolves to), then joins each. Must run in a freshly-forked child.
+fn join_container_namespaces(leader: i32) -> Result<()> {
+    use nix::sched::setns;
+    let order = ns_join_order(leader);
+    let mut fds = Vec::new();
+    for (ns, flag) in order {
+        let path = format!("/proc/{leader}/ns/{ns}");
+        let f = std::fs::File::open(&path).with_context(|| format!("open {path}"))?;
+        fds.push((f, flag));
+    }
+    for (f, flag) in &fds {
+        setns(f, *flag).with_context(|| format!("setns {flag:?}"))?;
+    }
+    Ok(())
+}
+
+/// A pseudo-terminal attached to an interactive `/bin/bash` running inside the
+/// container. `master` is the host-side PTY fd (read its output, write input,
+/// resize it); `pid` is the host pid of the in-container shell, so the caller
+/// can `kill` it to end the session (closing the master also hangs it up).
+pub struct ShellPty {
+    pub master: RawFd,
+    pub pid: i32,
+}
+
+/// Open an interactive login shell inside the running container (`leader`) on a
+/// fresh PTY and return its host-side handle. The shell runs as `as_uid` with a
+/// clean environment plus `env`. Used by the GUI to embed a terminal.
+pub fn open_shell_pty(
+    leader: i32,
+    as_uid: Option<u32>,
+    env: &[(String, String)],
+    rows: u16,
+    cols: u16,
+) -> Result<ShellPty> {
+    let ws = Winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let pty = openpty(Some(&ws), None).context("openpty")?;
+    // Relay the in-container shell's *host* pid back to the caller.
+    let (pid_r, pid_w) = make_pipe()?;
+
+    match unsafe { fork() }.context("fork")? {
+        ForkResult::Parent { child } => {
+            drop(pty.slave);
+            close_fd(pid_w);
+            let mut buf = [0u8; 4];
+            let n = unsafe { nix::libc::read(pid_r, buf.as_mut_ptr() as *mut _, 4) };
+            close_fd(pid_r);
+            // Reap the short-lived namespace-entering relay (it exits at once).
+            let _ = waitpid(child, None);
+            if n != 4 {
+                drop(pty.master);
+                anyhow::bail!("shell failed to start in the container");
+            }
+            Ok(ShellPty {
+                master: pty.master.into_raw_fd(),
+                pid: i32::from_ne_bytes(buf),
+            })
+        }
+        ForkResult::Child => {
+            // Relay process: enter the container namespaces, then fork the shell
+            // (which lands in the container's pid namespace).
+            drop(pty.master);
+            close_fd(pid_r);
+            let slave = pty.slave.as_raw_fd();
+            if join_container_namespaces(leader).is_err() {
+                unsafe { nix::libc::_exit(126) }
+            }
+            match unsafe { fork() } {
+                Ok(ForkResult::Parent { child: shell }) => {
+                    let b = shell.as_raw().to_ne_bytes();
+                    let _ = unsafe { nix::libc::write(pid_w, b.as_ptr() as *const _, 4) };
+                    close_fd(pid_w);
+                    unsafe { nix::libc::_exit(0) }
+                }
+                Ok(ForkResult::Child) => {
+                    // The shell: own a new session with the PTY as controlling tty.
+                    let _ = setsid();
+                    unsafe { nix::libc::ioctl(slave, nix::libc::TIOCSCTTY as _, 0) };
+                    let _ = dup2(slave, 0);
+                    let _ = dup2(slave, 1);
+                    let _ = dup2(slave, 2);
+                    if slave > 2 {
+                        close_fd(slave);
+                    }
+                    close_fd(pid_w);
+                    if let Some(uid) = as_uid {
+                        let _ = nix::unistd::setgid(nix::unistd::Gid::from_raw(uid));
+                        let _ = nix::unistd::setuid(nix::unistd::Uid::from_raw(uid));
+                    }
+                    apply_clean_env(env);
+                    let home = env
+                        .iter()
+                        .find(|(k, _)| k == "HOME")
+                        .map(|(_, v)| v.as_str())
+                        .unwrap_or("/");
+                    let _ = chdir(home);
+                    let prog = CString::new("/bin/bash").unwrap();
+                    let args = [
+                        CString::new("/bin/bash").unwrap(),
+                        CString::new("--login").unwrap(),
+                    ];
+                    let _ = execv(&prog, &args);
+                    unsafe { nix::libc::_exit(127) }
+                }
+                Err(_) => unsafe { nix::libc::_exit(125) },
+            }
+        }
+    }
+}
+
+/// Tell the PTY its new window size (so full-screen programs like `htop` and
+/// line editing reflow). Best-effort.
+pub fn pty_resize(master: RawFd, rows: u16, cols: u16) {
+    let ws = Winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    unsafe {
+        nix::libc::ioctl(master, nix::libc::TIOCSWINSZ as _, &ws as *const Winsize);
+    }
 }
 
 /// Join the leader's namespaces, fork into the pid namespace, and run `f` there.

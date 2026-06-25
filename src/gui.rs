@@ -10,13 +10,15 @@
 //! window stays responsive. The app is tray-resident: closing the window hides
 //! it to the tray (when a tray is available); only the tray's "Quit" exits.
 
+use std::os::unix::io::RawFd;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
 
+use base64::Engine;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 
 use intune_container::doctor::Check;
 use intune_container::ops::{self, DaemonReport, DestroyOutcome, StatusReport};
@@ -92,6 +94,11 @@ async fn stop() -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn start() -> Result<(), String> {
+    run_blocking(|| privileged(ops::start)).await
+}
+
+#[tauri::command]
 async fn detach_display() -> Result<(), String> {
     run_blocking(|| privileged(ops::detach_display)).await
 }
@@ -125,18 +132,130 @@ async fn destroy(purge: bool) -> Result<DestroyOutcome, String> {
     run_blocking(move || privileged(|| ops::destroy(purge))).await
 }
 
-/// Open an interactive shell. A shell inherently needs a terminal, so we launch
-/// the user's terminal emulator running `machinectl shell` directly (this is the
-/// standard tool, not the intune-container CLI).
+/// ===== Interactive shell (in-app PTY terminal) =====
+///
+/// A `/bin/bash` runs on a PTY inside the container; we stream its output to the
+/// GUI as `shell://data` events (base64) and accept keystrokes via `shell_input`.
+/// At most one session exists at a time, identified by `id` so a stale reader
+/// never clears a newer session's state.
+struct ShellHandle {
+    id: u64,
+    master: RawFd,
+    pid: i32,
+}
+
+#[derive(Default)]
+struct ShellState(Mutex<Option<ShellHandle>>);
+
+static SHELL_SEQ: AtomicU64 = AtomicU64::new(0);
+const B64: base64::engine::general_purpose::GeneralPurpose =
+    base64::engine::general_purpose::STANDARD;
+
+/// Open (or replace) the interactive shell, sized to `rows`x`cols`.
 #[tauri::command]
-fn open_shell() -> Result<(), String> {
-    let status = ops::status();
-    if !status.configured {
-        return Err("not set up yet".into());
+async fn shell_open(
+    app: AppHandle,
+    state: State<'_, ShellState>,
+    rows: u16,
+    cols: u16,
+) -> Result<(), String> {
+    let pty = run_blocking(move || {
+        let target = ops::shell_session()?;
+        intune_container::runtime::open_shell_pty(
+            target.leader,
+            Some(target.uid),
+            &target.env,
+            rows,
+            cols,
+        )
+    })
+    .await?;
+
+    let id = SHELL_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
+    {
+        let mut g = state.0.lock().unwrap();
+        // Replace any existing session: killing the old shell makes its reader
+        // hit EOF and close its own master fd, so we never close it cross-thread.
+        if let Some(old) = g.as_ref() {
+            unsafe { nix::libc::kill(old.pid, nix::libc::SIGKILL) };
+        }
+        *g = Some(ShellHandle {
+            id,
+            master: pty.master,
+            pid: pty.pid,
+        });
     }
-    let target = format!("{}@{}", status.host_user, status.machine_name);
-    open_terminal(&["machinectl", "shell", &target, "/bin/bash", "--login"])
-        .map_err(|e| e.to_string())
+
+    let master = pty.master;
+    let app2 = app.clone();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = unsafe { nix::libc::read(master, buf.as_mut_ptr() as *mut _, buf.len()) };
+            if n <= 0 {
+                break;
+            }
+            let payload = B64.encode(&buf[..n as usize]);
+            if app2.emit("shell://data", payload).is_err() {
+                break;
+            }
+        }
+        // The shell ended (or was killed). Clear our slot if it's still ours, and
+        // close the master under the lock so input/resize never race the close.
+        let st = app2.state::<ShellState>();
+        let mut g = st.0.lock().unwrap();
+        if matches!(g.as_ref(), Some(h) if h.id == id) {
+            *g = None;
+        }
+        unsafe { nix::libc::close(master) };
+        drop(g);
+        let _ = app2.emit("shell://exit", ());
+    });
+    Ok(())
+}
+
+/// Send keystrokes (base64-encoded UTF-8) to the shell.
+#[tauri::command]
+fn shell_input(state: State<'_, ShellState>, data: String) -> Result<(), String> {
+    let bytes = B64.decode(data).map_err(|e| e.to_string())?;
+    let g = state.0.lock().unwrap();
+    if let Some(h) = g.as_ref() {
+        let mut off = 0;
+        while off < bytes.len() {
+            let n = unsafe {
+                nix::libc::write(
+                    h.master,
+                    bytes[off..].as_ptr() as *const _,
+                    bytes.len() - off,
+                )
+            };
+            if n <= 0 {
+                break;
+            }
+            off += n as usize;
+        }
+    }
+    Ok(())
+}
+
+/// Tell the shell its terminal was resized.
+#[tauri::command]
+fn shell_resize(state: State<'_, ShellState>, rows: u16, cols: u16) -> Result<(), String> {
+    let g = state.0.lock().unwrap();
+    if let Some(h) = g.as_ref() {
+        intune_container::runtime::pty_resize(h.master, rows, cols);
+    }
+    Ok(())
+}
+
+/// End the shell session (the reader closes the fd on the resulting EOF).
+#[tauri::command]
+fn shell_close(state: State<'_, ShellState>) -> Result<(), String> {
+    let g = state.0.lock().unwrap();
+    if let Some(h) = g.as_ref() {
+        unsafe { nix::libc::kill(h.pid, nix::libc::SIGKILL) };
+    }
+    Ok(())
 }
 
 // ===== Logs =====
@@ -215,69 +334,6 @@ fn clear_log() -> Result<(), String> {
         std::fs::write(&path, b"").map_err(|e| e.to_string())?;
     }
     Ok(())
-}
-
-// ===== Terminal launch (shell only) =====
-
-fn which(program: &str) -> bool {
-    std::env::var_os("PATH")
-        .map(|path| std::env::split_paths(&path).any(|dir| dir.join(program).is_file()))
-        .unwrap_or(false)
-}
-
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
-
-/// Run a command inside the user's terminal emulator.
-fn open_terminal(argv: &[&str]) -> anyhow::Result<()> {
-    let joined = argv
-        .iter()
-        .copied()
-        .map(shell_quote)
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    let candidates: &[(&str, &[&str])] = &[
-        ("foot", &["-e", "sh", "-c"]),
-        ("kitty", &["sh", "-c"]),
-        ("alacritty", &["-e", "sh", "-c"]),
-        ("wezterm", &["start", "--", "sh", "-c"]),
-        ("konsole", &["-e", "sh", "-c"]),
-        ("gnome-terminal", &["--", "sh", "-c"]),
-        ("xterm", &["-e", "sh", "-c"]),
-        ("x-terminal-emulator", &["-e", "sh", "-c"]),
-    ];
-
-    for (term, prefix) in candidates {
-        if which(term) {
-            let mut cmd = Command::new(term);
-            cmd.args(*prefix)
-                .arg(&joined)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
-            detach(&mut cmd);
-            if cmd.spawn().is_ok() {
-                return Ok(());
-            }
-        }
-    }
-    anyhow::bail!("no terminal emulator found")
-}
-
-fn detach(cmd: &mut Command) {
-    unsafe {
-        use std::os::unix::process::CommandExt;
-        cmd.pre_exec(|| {
-            extern "C" {
-                fn setsid() -> i32;
-            }
-            // SAFETY: setsid takes no args; failure (already a leader) is fine.
-            let _ = setsid();
-            Ok(())
-        });
-    }
 }
 
 // ===== Window / tray =====
@@ -390,6 +446,7 @@ pub fn run() {
             show_main_window(app);
         }))
         .plugin(tauri_plugin_dialog::init())
+        .manage(ShellState::default())
         .invoke_handler(tauri::generate_handler![
             get_status,
             get_doctor,
@@ -399,11 +456,15 @@ pub fn run() {
             edge,
             daemon,
             stop,
+            start,
             detach_display,
             backup,
             restore,
             destroy,
-            open_shell,
+            shell_open,
+            shell_input,
+            shell_resize,
+            shell_close,
             read_log,
             clear_log,
             default_backup_path,
