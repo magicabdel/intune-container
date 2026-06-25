@@ -1,12 +1,20 @@
-//! intune-container: a single binary that is both the graphical interface (the
-//! default) and the command-line tool.
+//! intune-container: a single binary that is the command-line tool and — when
+//! built with the `gui` feature — also the graphical interface.
 //!
-//! * Run with **no subcommand** (or `gui`) to open the Tauri desktop interface.
+//! * Run with **no subcommand** (or `gui`) to open the desktop interface. The
+//!   `gui`-feature build runs the embedded Tauri app; the CLI-only build
+//!   downloads and launches the packaged desktop app on demand
+//!   (see [`gui_bootstrap`]).
 //! * Run with any **subcommand** (`enroll`, `edge`, `stop`, …) for CLI behavior.
 //!
 //! Both paths call the same in-process [`intune_container::ops`] functions.
 
+#[cfg(feature = "gui")]
 mod gui;
+
+// CLI-only build: a tiny bootstrapper that fetches/launches the packaged GUI.
+#[cfg(not(feature = "gui"))]
+mod gui_bootstrap;
 
 use std::io::IsTerminal;
 
@@ -33,7 +41,8 @@ struct Cli {
     verbose: bool,
 
     /// Run the interface in the foreground instead of detaching from the
-    /// terminal (only affects the GUI; useful for debugging).
+    /// terminal (only affects the embedded GUI; useful for debugging).
+    #[cfg(feature = "gui")]
     #[arg(short = 'F', long, global = true, hide = true)]
     foreground: bool,
 }
@@ -160,16 +169,38 @@ fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
+    #[cfg(feature = "gui")]
     let foreground = cli.foreground;
 
     let Some(command) = cli.command else {
-        // No subcommand → open the graphical interface.
-        run_or_detach_gui(foreground);
-        return Ok(());
+        // No subcommand → open the interface.
+        #[cfg(feature = "gui")]
+        {
+            run_or_detach_gui(foreground);
+            return Ok(());
+        }
+        #[cfg(not(feature = "gui"))]
+        {
+            // No interface is compiled in. On a graphical session, install (if
+            // needed) and launch the packaged desktop app; on a headless host,
+            // show the CLI help instead of fetching a GUI that can't run.
+            if gui_bootstrap::has_display() {
+                return gui_bootstrap::install_and_launch();
+            }
+            use clap::CommandFactory;
+            Cli::command().print_help().ok();
+            println!();
+            return Ok(());
+        }
     };
 
     match command {
-        Command::Gui => run_or_detach_gui(foreground),
+        Command::Gui => {
+            #[cfg(feature = "gui")]
+            run_or_detach_gui(foreground);
+            #[cfg(not(feature = "gui"))]
+            gui_bootstrap::install_and_launch()?;
+        }
         Command::Init { force, image } => cmd_init(force, image)?,
         Command::Enroll { image } => cmd_enroll(image)?,
         Command::Start => cmd_start()?,
@@ -220,6 +251,7 @@ fn cmd_rootless_exec(leader: i32, uid: u32, script: String, env: Vec<String>) ->
 /// launching shell is freed and closing it won't kill the app. `--foreground`
 /// (or the internal child marker set on the re-spawned process) keeps it
 /// attached.
+#[cfg(feature = "gui")]
 fn run_or_detach_gui(foreground: bool) {
     if foreground || std::env::var_os("INTUNE_CONTAINER_GUI_CHILD").is_some() {
         gui::run();
@@ -239,6 +271,7 @@ fn run_or_detach_gui(foreground: bool) {
 /// Re-spawn this binary as a detached `gui` child in its own session, with stdio
 /// redirected, so it survives the terminal closing (no controlling tty → no
 /// SIGHUP). Its stderr is captured to a log for diagnosability.
+#[cfg(feature = "gui")]
 fn spawn_detached_gui() -> Result<()> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
@@ -275,6 +308,7 @@ fn spawn_detached_gui() -> Result<()> {
 
 /// Append-mode log for the detached GUI child
 /// (`~/.local/share/intune-container/gui.log`).
+#[cfg(feature = "gui")]
 fn open_gui_log() -> Option<std::fs::File> {
     let dir = std::env::var_os("XDG_DATA_HOME")
         .map(std::path::PathBuf::from)

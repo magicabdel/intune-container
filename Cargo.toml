@@ -10,8 +10,15 @@ categories = ["command-line-utilities"]
 authors = ["Abdessalam ZAIMI <abdessalam@zaimi.dev>"]
 repository = "https://github.com/magicabdel/intune-container"
 
+# The crate published to crates.io is the CLI (the `gui` feature is off by
+# default). The desktop interface is built from the git repo with
+# `--features gui`, so its assets — useless without the compile-time frontend
+# build — are kept out of the package.
+exclude = ["/frontend", "/docs", "/site"]
+
 # One package, two targets: a library with all the logic, and a single binary
-# that is both the graphical interface (default) and the command-line tool.
+# that is the command-line tool and — when built with the `gui` feature — the
+# graphical interface.
 [lib]
 name = "intune_container"
 path = "src/lib.rs"
@@ -21,11 +28,26 @@ name = "intune-container"
 path = "src/main.rs"
 
 [build-dependencies]
-# Processes tauri.conf.json + the capability schemas for the GUI.
-tauri-build = { version = "2", features = [] }
+# Processes tauri.conf.json + the capability schemas for the GUI. Optional and
+# only invoked by build.rs under the `gui` feature; the CLI build needs none of
+# it (and thus no compiled frontend).
+tauri-build = { version = "2", features = [], optional = true }
 
 [features]
+# CLI-only by default: `cargo build`, `cargo install` and `cargo publish` need
+# no GTK/WebKitGTK and no compiled frontend, and the CLI links fully statically
+# (musl). The desktop interface is opt-in.
 default = []
+# The Tauri desktop interface (tray, window, overlay). Building it additionally
+# requires the system WebKitGTK/GTK libraries and the compiled frontend at
+# `frontend/dist` (run `npm --prefix frontend run build` first).
+gui = [
+    "dep:tauri",
+    "dep:tauri-plugin-dialog",
+    "dep:tauri-plugin-single-instance",
+    "dep:tauri-build",
+    "dep:base64",
+]
 
 [dependencies]
 # --- Core ---
@@ -36,8 +58,8 @@ serde_json = "1"
 toml = "0.8"
 tracing = "0.1"
 # Encodes raw PTY bytes for the interactive shell so they survive JSON transport
-# to the GUI terminal.
-base64 = "0.22"
+# to the GUI terminal (GUI-only).
+base64 = { version = "0.22", optional = true }
 
 # D-Bus (native messaging host → container broker)
 zbus = { version = "4", default-features = false, features = ["tokio"] }
@@ -52,14 +74,14 @@ clap = { version = "4", features = ["derive"] }
 rpassword = "7"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# --- GUI front-end (Tauri) ---
+# --- GUI front-end (Tauri) --- all gated behind the `gui` feature.
 # `tray-icon` gives the system-tray indicator; `image-png` embeds/loads the icon.
-tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri = { version = "2", features = ["tray-icon", "image-png"], optional = true }
 # Native file open/save dialogs (backup destination / restore source).
-tauri-plugin-dialog = "2"
+tauri-plugin-dialog = { version = "2", optional = true }
 # Ensures a second launch focuses the existing window instead of starting a
 # duplicate GUI/tray instance (DBus-based on Linux).
-tauri-plugin-single-instance = "2"
+tauri-plugin-single-instance = { version = "2", optional = true }
 
 # --- Rootless runtime ---
 # Pull OCI images without docker/podman, and extract layers without `tar`.

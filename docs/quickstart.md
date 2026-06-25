@@ -4,9 +4,10 @@
 
 Pick one:
 
-=== "Prebuilt binary"
+=== "AppImage (recommended)"
 
-    Static Linux x86_64 binary from the latest GitHub Release, into `~/.local/bin`:
+    The latest AppImage from the GitHub Release, installed to `~/.local/bin` as
+    `intune-container`:
 
     ```sh
     curl -fsSL https://raw.githubusercontent.com/magicabdel/intune-container/master/install.sh | sh
@@ -14,19 +15,25 @@ Pick one:
     ```
 
     Override the location with `DEST=/usr/local/bin`, or pin a version with
-    `VERSION=v0.2.0`.
+    `VERSION=v0.2.0`. (AppImages need FUSE, which ships on most desktops.)
 
-=== "cargo"
+=== ".deb / .rpm"
+
+    Grab the package for your distro from the
+    [latest release](https://github.com/magicabdel/intune-container/releases/latest):
 
     ```sh
-    cargo install intune-container
+    sudo apt install ./intune-container_*_amd64.deb     # Debian / Ubuntu
+    sudo dnf install ./intune-container-*.x86_64.rpm     # Fedora
     ```
 
 === "From source"
 
     ```sh
-    just install      # builds and installs to ~/.local/bin (no sudo)
+    just install      # builds the GUI and installs to ~/.local/bin (no sudo)
     ```
+
+    Needs Rust, Node.js + npm, and the WebKitGTK/GTK dev libraries.
 
 Make sure `~/.local/bin` is on your `PATH`. The same binary is **both** the
 graphical interface and the command-line tool: run it with **no subcommand** for

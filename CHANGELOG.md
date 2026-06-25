@@ -23,6 +23,12 @@ to follow [Semantic Versioning](https://semver.org/) once it reaches 1.0.
 - The browser SSO native-host bridge runs **inside** the container (via `setns`)
   against the container's own session bus; the host session bus is no longer
   exposed.
+- **Distribution.** Releases now ship Linux desktop bundles — **AppImage**,
+  `.deb`, and `.rpm`, built by Tauri — and `install.sh` installs the AppImage to
+  `~/.local/bin`. The static musl CLI binary and the crates.io publish are gone:
+  the GUI links WebKitGTK/GTK, so it can't be a static binary or build on
+  crates.io. Building from source needs Node.js + npm and the WebKitGTK/GTK dev
+  libraries.
 
 ### Added
 

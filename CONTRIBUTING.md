@@ -4,7 +4,11 @@ Thanks for your interest in improving `intune-container`!
 
 ## Development setup
 
-You'll need a Rust toolchain and [`just`](https://github.com/casey/just).
+You'll need a Rust toolchain and [`just`](https://github.com/casey/just). Building
+the GUI (`just build`/`just install`) also needs Node.js + npm and the
+WebKitGTK/GTK development libraries (`libwebkit2gtk-4.1-dev`, `libgtk-3-dev`,
+`libayatana-appindicator3-dev`, `librsvg2-dev`, `libsoup-3.0-dev` on
+Debian/Ubuntu).
 
 ```sh
 just build      # cargo build --release

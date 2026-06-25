@@ -32,7 +32,15 @@ Hyprland, Sway, GNOME, KDE) and X11.
 
 ## Quick start
 
-Build and install the single binary from source:
+Install the latest AppImage to `~/.local/bin`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/magicabdel/intune-container/master/install.sh | sh
+```
+
+Prefer a package or building yourself? Grab the `.deb`/`.rpm` from the
+[releases](https://github.com/magicabdel/intune-container/releases/latest), or
+build from source (needs Rust, Node.js + npm, and WebKitGTK/GTK):
 
 ```sh
 just install   # builds + installs `intune-container` (GUI + CLI in one binary)
