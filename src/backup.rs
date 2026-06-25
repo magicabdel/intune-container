@@ -223,6 +223,6 @@ pub fn restore_rootless(input: Option<&Path>) -> Result<()> {
     }
 
     let _ = std::fs::remove_dir_all(&tmp);
-    info!("Enrollment state restored. Bring the container up with: intune-container daemon");
+    info!("Enrollment state restored. Bring the container up with: intune-container start");
     Ok(())
 }

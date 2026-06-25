@@ -12,9 +12,12 @@ import "@fontsource/ibm-plex-mono/400.css";
 import "@fontsource/ibm-plex-mono/500.css";
 
 import { App } from "./App";
+import { Overlay } from "./Overlay";
+
+// The same bundle drives two windows: the full interface ("main") and the tray
+// quick-panel, which loads at index.html#overlay.
+const isOverlay = window.location.hash === "#overlay";
 
 createRoot(document.getElementById("root") as HTMLElement).render(
-  <React.StrictMode>
-    <App />
-  </React.StrictMode>,
+  <React.StrictMode>{isOverlay ? <Overlay /> : <App />}</React.StrictMode>,
 );

@@ -13,15 +13,18 @@
 use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use base64::Engine;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
+use tauri::{
+    AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, State, WebviewUrl, WebviewWindow,
+    WebviewWindowBuilder, WindowEvent, Wry,
+};
 
 use intune_container::doctor::Check;
-use intune_container::ops::{self, DaemonReport, DestroyOutcome, StatusReport};
+use intune_container::ops::{self, DestroyOutcome, StartReport, StatusReport};
 
 /// Whether a system-tray icon was successfully created. When false (e.g. no
 /// libappindicator on the host), closing the window exits the app instead of
@@ -64,6 +67,13 @@ async fn get_doctor() -> Vec<Check> {
 }
 
 #[tauri::command]
+async fn get_account() -> Option<intune_container::native_host::AccountInfo> {
+    tauri::async_runtime::spawn_blocking(|| ops::account().ok().flatten())
+        .await
+        .unwrap_or(None)
+}
+
+#[tauri::command]
 fn is_initialized() -> bool {
     ops::is_initialized()
 }
@@ -84,18 +94,13 @@ async fn edge() -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn daemon() -> Result<DaemonReport, String> {
-    run_blocking(|| privileged(ops::daemon)).await
+async fn start() -> Result<StartReport, String> {
+    run_blocking(|| privileged(ops::start)).await
 }
 
 #[tauri::command]
 async fn stop() -> Result<(), String> {
     run_blocking(|| privileged(ops::stop)).await
-}
-
-#[tauri::command]
-async fn start() -> Result<(), String> {
-    run_blocking(|| privileged(ops::start)).await
 }
 
 #[tauri::command]
@@ -344,33 +349,175 @@ fn show_main_window(app: &AppHandle) {
         let _ = window.unminimize();
         let _ = window.set_focus();
     }
+    // Opening the full interface dismisses the quick overlay.
+    if let Some(overlay) = app.get_webview_window("overlay") {
+        let _ = overlay.hide();
+    }
 }
+
+/// Show the full interface (invoked from the overlay's "Open interface" button).
+#[tauri::command]
+fn show_interface(app: AppHandle) {
+    show_main_window(&app);
+}
+
+/// Toggle the tray overlay: a small frameless quick-panel anchored near the
+/// click. Shown on a single tray click, hidden again on the next click or when
+/// it loses focus.
+fn toggle_overlay(app: &AppHandle, at: PhysicalPosition<f64>) {
+    let Some(win) = app.get_webview_window("overlay") else {
+        // No overlay window (e.g. it failed to build) — fall back to the full UI.
+        show_main_window(app);
+        return;
+    };
+    if win.is_visible().unwrap_or(false) {
+        let _ = win.hide();
+        return;
+    }
+    position_overlay(&win, at);
+    let _ = win.show();
+    let _ = win.set_focus();
+}
+
+/// Anchor the overlay near the tray click, clamped to the monitor (flips above
+/// the cursor when there isn't room below, e.g. a bottom panel).
+fn position_overlay(win: &WebviewWindow, at: PhysicalPosition<f64>) {
+    let size = win.outer_size().unwrap_or(PhysicalSize::new(340, 470));
+    let (w, h) = (size.width as f64, size.height as f64);
+    let mut x = at.x - w / 2.0;
+    let mut y = at.y + 12.0;
+    if let Ok(Some(mon)) = win.current_monitor() {
+        let mp = mon.position();
+        let ms = mon.size();
+        let (mx, my) = (mp.x as f64, mp.y as f64);
+        let (mw, mh) = (ms.width as f64, ms.height as f64);
+        x = x.clamp(mx + 8.0, mx + mw - w - 8.0);
+        if y + h > my + mh - 8.0 {
+            y = at.y - h - 12.0;
+        }
+        y = y.max(my + 8.0);
+    }
+    let _ = win.set_position(PhysicalPosition::new(x, y));
+}
+
+/// The dynamic "Start/Stop container" tray item, kept so the watcher can retitle
+/// it as the container's state changes.
+static POWER_ITEM: OnceLock<MenuItem<Wry>> = OnceLock::new();
 
 /// Fire a fire-and-forget background operation from a tray menu item.
 fn fire(action: &'static str) {
     tauri::async_runtime::spawn(async move {
         let _ = tauri::async_runtime::spawn_blocking(move || match action {
+            "portal" => privileged(|| ops::enroll().map(|_| ())),
             "edge" => privileged(|| ops::edge(false, &[])),
             "stop" => privileged(ops::stop),
+            "start" => privileged(|| ops::start().map(|_| ())),
             _ => Ok(()),
         })
         .await;
     });
 }
 
+/// Start or stop the container depending on its current state (the single
+/// "power" tray item toggles between the two).
+fn fire_power() {
+    tauri::async_runtime::spawn(async move {
+        let _ = tauri::async_runtime::spawn_blocking(|| {
+            if ops::status().running {
+                privileged(ops::stop)
+            } else {
+                privileged(|| ops::start().map(|_| ()))
+            }
+        })
+        .await;
+    });
+}
+
+/// A 32px round tray glyph in the given color — the container's status light.
+fn status_icon(rgb: (u8, u8, u8)) -> tauri::image::Image<'static> {
+    const N: usize = 32;
+    let mut px = vec![0u8; N * N * 4];
+    let c = (N as f32 - 1.0) / 2.0;
+    let radius = 13.0_f32;
+    for y in 0..N {
+        for x in 0..N {
+            let dx = x as f32 - c;
+            let dy = y as f32 - c;
+            let d = (dx * dx + dy * dy).sqrt();
+            // 1px soft edge for a clean circle.
+            let alpha = if d <= radius - 1.0 {
+                255.0
+            } else if d >= radius {
+                0.0
+            } else {
+                (radius - d) * 255.0
+            };
+            let i = (y * N + x) * 4;
+            px[i] = rgb.0;
+            px[i + 1] = rgb.1;
+            px[i + 2] = rgb.2;
+            px[i + 3] = alpha as u8;
+        }
+    }
+    tauri::image::Image::new_owned(px, N as u32, N as u32)
+}
+
+/// Poll the container state and keep the tray in sync: retitle the power item
+/// (Start vs Stop) and tint the tray icon (grey = stopped, teal = running
+/// headless, amber = display attached). Only updates on change.
+fn spawn_tray_watcher(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let mut prev: Option<(bool, (u8, u8, u8))> = None;
+        loop {
+            if let Ok(st) = tauri::async_runtime::spawn_blocking(ops::status).await {
+                let running = st.running;
+                let color = if !st.configured || !st.initialized || !running {
+                    (0x5e, 0x6b, 0x7c) // faint — stopped / not set up
+                } else if st.display_forwarding {
+                    (0xe8, 0xa2, 0x3d) // breach — display attached
+                } else {
+                    (0x23, 0xc9, 0xb8) // seal — running headless
+                };
+                if prev != Some((running, color)) {
+                    prev = Some((running, color));
+                    let app2 = app.clone();
+                    let _ = app.run_on_main_thread(move || {
+                        if let Some(item) = POWER_ITEM.get() {
+                            let _ = item.set_text(if running {
+                                "Stop container"
+                            } else {
+                                "Start container"
+                            });
+                        }
+                        if let Some(tray) = app2.tray_by_id("main") {
+                            let _ = tray.set_icon(Some(status_icon(color)));
+                        }
+                    });
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        }
+    });
+}
+
 fn build_tray_inner(app: &AppHandle) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open", "Open Interface", true, None::<&str>)?;
+    let portal = MenuItem::with_id(app, "portal", "Open Intune portal", true, None::<&str>)?;
     let edge = MenuItem::with_id(app, "edge", "Open Microsoft Edge", true, None::<&str>)?;
-    let stop = MenuItem::with_id(app, "stop", "Stop container", true, None::<&str>)?;
+    // Title is updated to "Stop container" by the tray watcher when it's running.
+    let power = MenuItem::with_id(app, "power", "Start container", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+    let _ = POWER_ITEM.set(power.clone());
 
     let menu = Menu::with_items(
         app,
         &[
             &open,
             &PredefinedMenuItem::separator(app)?,
+            &portal,
             &edge,
-            &stop,
+            &PredefinedMenuItem::separator(app)?,
+            &power,
             &PredefinedMenuItem::separator(app)?,
             &quit,
         ],
@@ -388,19 +535,28 @@ fn build_tray_inner(app: &AppHandle) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().as_ref() {
             "open" => show_main_window(app),
+            "portal" => fire("portal"),
             "edge" => fire("edge"),
-            "stop" => fire("stop"),
+            "power" => fire_power(),
             "quit" => app.exit(0),
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
-            if let TrayIconEvent::Click {
-                button: MouseButton::Left,
-                button_state: MouseButtonState::Up,
-                ..
-            } = event
-            {
-                show_main_window(tray.app_handle());
+            let app = tray.app_handle();
+            match event {
+                // Single left-click → the quick overlay near the tray.
+                TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    position,
+                    ..
+                } => toggle_overlay(app, position),
+                // Double-click → the full interface.
+                TrayIconEvent::DoubleClick {
+                    button: MouseButton::Left,
+                    ..
+                } => show_main_window(app),
+                _ => {}
             }
         })
         .build(app)?;
@@ -450,11 +606,11 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_status,
             get_doctor,
+            get_account,
             is_initialized,
             init,
             enroll,
             edge,
-            daemon,
             stop,
             start,
             detach_display,
@@ -465,23 +621,46 @@ pub fn run() {
             shell_input,
             shell_resize,
             shell_close,
+            show_interface,
             read_log,
             clear_log,
             default_backup_path,
         ])
-        .on_window_event(|window, event| {
-            // With a tray, closing the window hides it there; without one,
-            // closing exits (otherwise the app would be unreachable).
-            if let WindowEvent::CloseRequested { api, .. } = event {
-                if TRAY_AVAILABLE.load(Ordering::SeqCst) {
+        .on_window_event(|window, event| match event {
+            // With a tray, closing the main window hides it there (the overlay too)
+            // instead of exiting; without a tray, closing the main window exits.
+            WindowEvent::CloseRequested { api, .. } => {
+                if window.label() == "overlay" || TRAY_AVAILABLE.load(Ordering::SeqCst) {
                     let _ = window.hide();
                     api.prevent_close();
                 }
             }
+            // The overlay is a transient popover: dismiss it when it loses focus.
+            WindowEvent::Focused(false) if window.label() == "overlay" => {
+                let _ = window.hide();
+            }
+            _ => {}
         })
         .setup(|app| {
             let tray_ok = build_tray(app.handle());
             TRAY_AVAILABLE.store(tray_ok, Ordering::SeqCst);
+            if tray_ok {
+                spawn_tray_watcher(app.handle().clone());
+            }
+            // A hidden, frameless quick-panel shown on a single tray click.
+            let _ = WebviewWindowBuilder::new(
+                app,
+                "overlay",
+                WebviewUrl::App("index.html#overlay".into()),
+            )
+            .title("Intune Container")
+            .inner_size(340.0, 470.0)
+            .decorations(false)
+            .resizable(false)
+            .always_on_top(true)
+            .skip_taskbar(true)
+            .visible(false)
+            .build();
             Ok(())
         })
         .run(tauri::generate_context!())

@@ -2,10 +2,10 @@
 name = "intune-container"
 version = "0.1.0"
 edition = "2021"
-description = "Manage Microsoft Intune in a systemd-nspawn container (GUI + CLI in one binary)"
+description = "Manage Microsoft Intune in an isolated, rootless Linux container (GUI + CLI in one binary)"
 license = "MIT"
 readme = "README.md"
-keywords = ["intune", "systemd-nspawn", "sso", "entra", "linux"]
+keywords = ["intune", "rootless", "sso", "entra", "linux"]
 categories = ["command-line-utilities"]
 authors = ["Abdessalam ZAIMI <abdessalam@zaimi.dev>"]
 repository = "https://github.com/magicabdel/intune-container"

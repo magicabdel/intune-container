@@ -2,65 +2,73 @@
 
 ## Network isolation (the main gap)
 
-Today the container **shares the host network namespace** (started without
-`--private-network`, with the host resolver copied in). This is convenient — the
-container reaches the internet exactly as your user does — but it means the
-container can also reach `localhost` services and host-local *abstract* UNIX
-sockets (including a compositor's XWayland socket) regardless of whether a
-display is bound. Headless mode removes the *display* binding, not this network
-reachability.
+Today the container **shares the host network namespace** (no `CLONE_NEWNET`,
+with the host resolver copied in). This is convenient — the container reaches
+the internet exactly as your user does — but it means the container can also
+reach `localhost` services and host-local *abstract* UNIX sockets (including a
+compositor's XWayland socket) regardless of whether a display is bound. Headless
+mode removes the *display* binding, not this network reachability.
 
-The plan is to give the container its **own** network namespace and route it
-through a controlled NAT, coupled to the display mode:
+The plan is to give the container its **own** network namespace with userspace
+egress, coupled to the display mode:
 
 ```mermaid
 flowchart LR
     subgraph host[Host netns]
-        NAT[veth + NAT / firewall]
+        EG[userspace egress: passt / slirp4netns]
         LAN[LAN / localhost / host sockets]
     end
     subgraph ctr[Container private netns]
         APP[intune + broker]
     end
-    APP --> NAT --> WAN[Internet: Microsoft endpoints]
-    NAT -. blocked .-x LAN
+    APP --> EG --> WAN[Internet: Microsoft endpoints]
+    EG -. blocked .-x LAN
 ```
 
 ### Approach
 
-1. **Private netns by default for headless** (`daemon` / background SSO): start
-   the machine with `--private-network`, create a veth pair, NAT egress to the
-   internet, and **block RFC1918 / link-local / `localhost`** so the container
-   can't reach your LAN or host-local sockets. DNS via a public resolver
-   (e.g. `1.1.1.1`) or a forwarder.
-2. **Keep shared netns for `enroll` / `edge`** initially: those forward the real
+1. **Private netns for the headless container**: add `CLONE_NEWNET` and provide
+   egress through a userspace proxy (`passt` or `slirp4netns`) — no host root or
+   `CAP_NET_ADMIN` needed — so the container reaches the internet but **not** the
+   LAN, `localhost`, or host-local abstract sockets. DNS via the proxy.
+2. **Keep shared netns for the portal / Edge** initially: those forward the real
    display, which on some compositors relies on the abstract X socket reachable
    through the shared network namespace. Coupling private-netns to headless mode
-   avoids breaking the GUI flows while still hardening the long-running
-   background path.
-3. **Teardown** the veth/NAT rules on stop, since the host isn't assumed to run
-   `systemd-networkd`.
+   hardens the long-running background path without breaking the GUI flows.
+3. The `setns`-based SSO bridge already joins the container's namespaces, so it
+   keeps working when the netns becomes private.
 
 ### Open questions
 
-- Host firewall stack to integrate with (nftables / iptables / firewalld).
+- Whether to bundle a `passt`/`slirp4netns` dependency or detect it at runtime.
 - Behaviour under a host VPN (split tunnel vs. full tunnel).
-- Whether display GUI flows can also move to private netns once display
+- Whether the display GUI flows can also move to a private netns once display
   forwarding no longer depends on the shared namespace.
 
 ## Other planned work
 
-- **No-restart display attach** *(implemented)*: instead of stopping and
-  re-booting the container when a GUI flow needs the display, `enroll`/`edge`
-  bind the host display sockets into the running machine with `machinectl bind`
-  and unmount them again when the app exits. A background `daemon` SSO session
-  stays up across GUI usage. The container is one long-lived, always-headless
-  machine; a system tray (StatusNotifierItem) tracks it and exposes the common
-  actions.
-- **Preflight checks**: verify `systemd-nspawn`, `machinectl`, a container
-  engine, `nsenter`, and cgroup v2 up front with a single actionable error.
-- **CI**: lint/test/build on every PR (see the repository workflows).
+- **Live display attach**: attach the host display to an already-running
+  headless container without a restart. The display sockets are currently bound
+  at boot, so attaching/detaching restarts the container; doing it live needs a
+  `setns` bind-mount (and a shared IPC namespace for XWayland).
+- **Deeper hardening of the headless profile**: a seccomp allow-list, a dropped
+  capability bounding set, `no_new_privs`, a curated `/dev`, and an
+  AppArmor/SELinux profile.
+
+## Already shipped
+
+- **Rootless runtime**: the container boots inside an unprivileged user
+  namespace via a detached supervisor — no host root, no `sudo`,
+  `systemd-nspawn`, `machinectl`, or `nsenter`.
+- **Single instance**: a supervisor singleton lock guarantees at most one
+  running container, and the GUI focuses an existing window instead of starting
+  a duplicate.
+- **Preflight checks**: `enroll`/`status` fail fast with a clear error when
+  unprivileged user namespaces are disabled, no `/etc/subuid` range exists, or
+  cgroup v2 isn't mounted.
+- **cgroup resource limits**: the container's delegated scope caps process count
+  (and, headless, memory), so a runaway can't exhaust your session.
 
 !!! note
     Until private networking lands, treat the container as having the same
-    network reach as your user. See `SECURITY.md` for the current trust model.
+    network reach as your user.

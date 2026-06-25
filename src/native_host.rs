@@ -26,6 +26,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, error, info, warn};
@@ -185,6 +186,49 @@ pub fn test_blocking(bus_socket: &Path) -> Result<()> {
         .build()
         .context("failed to build tokio runtime")?;
     runtime.block_on(test(bus_socket))
+}
+
+/// The signed-in account, surfaced to the GUI (a subset of the broker's
+/// `getAccounts` reply).
+#[derive(Clone, Serialize, Deserialize)]
+pub struct AccountInfo {
+    pub name: String,
+    pub username: String,
+    pub tenant: String,
+}
+
+/// Query the broker for the first signed-in account. `Ok(None)` means no account
+/// is registered (not yet enrolled / keyring locked). Runs **inside** the
+/// container against the broker's session bus.
+pub fn accounts_blocking(bus_socket: &Path) -> Result<Option<AccountInfo>> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to build tokio runtime")?;
+    runtime.block_on(async {
+        let session_id = new_session_uuid();
+        let conn = connect_broker(bus_socket)
+            .await
+            .context("could not connect to the container broker bus")?;
+        let reply = handle_command(Some(&conn), &session_id, "getAccounts", &json!({})).await?;
+        let account = reply
+            .get("accounts")
+            .and_then(|a| a.as_array())
+            .and_then(|a| a.first());
+        Ok(account.map(|a| {
+            let field = |k: &str| {
+                a.get(k)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            AccountInfo {
+                name: field("name"),
+                username: field("username"),
+                tenant: field("realm"),
+            }
+        }))
+    })
 }
 
 async fn test(bus_socket: &Path) -> Result<()> {

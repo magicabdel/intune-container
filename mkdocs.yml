@@ -1,5 +1,5 @@
 site_name: intune-container
-site_description: Run Microsoft Intune in an isolated systemd-nspawn container with host browser SSO
+site_description: Run Microsoft Intune in an isolated, rootless Linux container with host browser SSO
 docs_dir: docs
 
 repo_url: https://github.com/magicabdel/intune-container

@@ -2,14 +2,16 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import styled from "@emotion/styled";
 import { keyframes } from "@emotion/react";
 import { open, save } from "@tauri-apps/plugin-dialog";
-import { api, Check, PHASE_COPY, phaseOf, StatusReport } from "./api";
-import { GlobalStyles, t, eyebrow } from "./theme";
+import { api, Check, Account, PHASE_COPY, phaseOf, StatusReport } from "./api";
+import { GlobalStyles, t } from "./theme";
 import { ContainmentCore } from "./components/ContainmentCore";
 import { HealthPanel } from "./components/HealthPanel";
 import { PasswordModal } from "./components/PasswordModal";
 import { LogsView } from "./components/LogsView";
 import { ShellView } from "./components/ShellView";
 import { BackupView } from "./components/BackupView";
+import { DestroyView } from "./components/DestroyView";
+import { UserCard } from "./components/UserCard";
 import { ToastData, ToastTone, Toasts } from "./components/Toast";
 
 /* ------------------------------------------------------------------ layout */
@@ -115,6 +117,11 @@ const Main = styled.main`
   padding: 34px 24px 16px;
 `;
 
+const fadeUp = keyframes`
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+`;
+
 const Col = styled.div`
   width: 100%;
   max-width: 560px;
@@ -122,6 +129,7 @@ const Col = styled.div`
   flex-direction: column;
   align-items: center;
   gap: 16px;
+  animation: ${fadeUp} 0.4s ease both;
 `;
 
 const CoreWrap = styled.div`
@@ -135,15 +143,6 @@ const StateWord = styled.div<{ hue: string }>`
   letter-spacing: 0.01em;
   color: ${(p) => p.hue};
   text-align: center;
-`;
-
-const Sub = styled.p`
-  margin: 5px 0 0;
-  font-size: 13px;
-  line-height: 1.5;
-  color: ${t.color.dim};
-  text-align: center;
-  max-width: 30ch;
 `;
 
 const CTARow = styled.div`
@@ -236,52 +235,30 @@ const HealthWrap = styled.div`
 
 /* ----- bottom utility bar: the quiet, secondary actions ----- */
 
-const UtilityBar = styled.div`
-  flex: none;
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-  padding: 12px 24px;
-  border-top: 1px solid ${t.color.lineSoft};
-  background: ${t.color.panel};
-`;
-
-const BarLabel = styled.span`
-  font-family: ${t.font.mono};
-  font-size: 10px;
-  letter-spacing: 0.18em;
-  text-transform: uppercase;
-  color: ${t.color.faint};
-  margin-right: 4px;
-`;
-
-const Spacer = styled.span`
-  flex: 1;
-`;
-
-const Chip = styled.button<{ danger?: boolean }>`
+const DetachBtn = styled.button`
+  margin-top: 9px;
   display: inline-flex;
   align-items: center;
   gap: 7px;
-  padding: 7px 13px;
-  border-radius: 999px;
-  border: 1px solid ${(p) => (p.danger ? t.color.breachDim : t.color.line)};
+  border: none;
   background: transparent;
-  color: ${(p) => (p.danger ? t.color.alert : t.color.text)};
-  font-family: ${t.font.body};
-  font-size: 12.5px;
   cursor: pointer;
-  transition:
-    border-color 0.15s ease,
-    background 0.15s ease,
-    color 0.15s ease;
+  font-family: ${t.font.mono};
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  color: ${t.color.breach};
+  &::before {
+    content: "";
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: ${t.color.breach};
+  }
   &:hover:not(:disabled) {
-    border-color: ${(p) => (p.danger ? t.color.alert : "#3a4658")};
-    background: ${t.color.panel2};
+    color: ${t.color.text};
   }
   &:disabled {
-    opacity: 0.38;
+    opacity: 0.5;
     cursor: not-allowed;
   }
 `;
@@ -295,90 +272,6 @@ const Footer = styled.footer`
   letter-spacing: 0.05em;
   color: ${t.color.faint};
   text-align: center;
-`;
-
-/* destroy confirmation */
-
-const Backdrop = styled.div`
-  position: fixed;
-  inset: 0;
-  background: rgba(4, 6, 9, 0.62);
-  display: grid;
-  place-items: center;
-  z-index: 40;
-`;
-
-const Dialog = styled.div`
-  width: min(440px, 92vw);
-  background: ${t.color.panel};
-  border: 1px solid ${t.color.alert};
-  border-radius: ${t.radius.lg};
-  padding: 24px 26px 20px;
-  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5);
-  h3 {
-    margin: 6px 0 8px;
-    font-family: ${t.font.display};
-    font-size: 18px;
-    color: ${t.color.alert};
-  }
-  p {
-    margin: 0 0 14px;
-    color: ${t.color.dim};
-    font-size: 13px;
-    line-height: 1.5;
-  }
-`;
-
-const Checkbox = styled.label`
-  display: flex;
-  gap: 9px;
-  align-items: flex-start;
-  font-size: 13px;
-  color: ${t.color.text};
-  margin-bottom: 18px;
-  cursor: pointer;
-  input {
-    margin-top: 2px;
-    accent-color: ${t.color.alert};
-  }
-  span {
-    color: ${t.color.dim};
-  }
-`;
-
-const DialogRow = styled.div`
-  display: flex;
-  justify-content: flex-end;
-  gap: 10px;
-`;
-
-const Ghost = styled.button`
-  font-family: ${t.font.display};
-  font-size: 13.5px;
-  padding: 9px 18px;
-  border-radius: ${t.radius.sm};
-  border: 1px solid ${t.color.line};
-  background: transparent;
-  color: ${t.color.text};
-  cursor: pointer;
-  &:hover {
-    border-color: #3a4658;
-  }
-`;
-
-const Destructive = styled.button`
-  font-family: ${t.font.display};
-  font-weight: 500;
-  font-size: 13.5px;
-  padding: 9px 18px;
-  border-radius: ${t.radius.sm};
-  border: 1px solid ${t.color.alert};
-  background: ${t.color.alert};
-  color: #190406;
-  cursor: pointer;
-  &:hover {
-    filter: brightness(1.08);
-  }
 `;
 
 /* ------------------------------------------------------------------- glyph */
@@ -409,16 +302,18 @@ export function App() {
   const [pending, setPending] = useState<Record<string, boolean>>({});
   const [toasts, setToasts] = useState<ToastData[]>([]);
   const [pwOpen, setPwOpen] = useState(false);
-  const [destroyOpen, setDestroyOpen] = useState(false);
   const [purge, setPurge] = useState(false);
-  const [view, setView] = useState<"console" | "logs" | "shell" | "backup">(
-    "console",
-  );
+  const [view, setView] = useState<
+    "console" | "logs" | "shell" | "backup" | "destroy"
+  >("console");
 
   const [checks, setChecks] = useState<Check[] | null>(null);
   const [doctorLoading, setDoctorLoading] = useState(false);
   const [checkedAt, setCheckedAt] = useState<number | null>(null);
   const doctorBusy = useRef(false);
+
+  const [account, setAccount] = useState<Account | null>(null);
+  const [accountLoading, setAccountLoading] = useState(true);
 
   const toastId = useRef(0);
 
@@ -445,16 +340,56 @@ export function App() {
     }
   }, []);
 
+  const refreshAccount = useCallback(async (): Promise<Account | null> => {
+    try {
+      const a = await api.getAccount();
+      setAccount(a);
+      return a;
+    } catch {
+      setAccount(null);
+      return null;
+    } finally {
+      setAccountLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
     refresh();
     refreshDoctor();
+    refreshAccount();
     const a = setInterval(refresh, 3000);
     const b = setInterval(refreshDoctor, 20000);
+    const c = setInterval(refreshAccount, 20000);
     return () => {
       clearInterval(a);
       clearInterval(b);
+      clearInterval(c);
     };
-  }, [refresh, refreshDoctor]);
+  }, [refresh, refreshDoctor, refreshAccount]);
+
+  // When the container's running state changes, the broker + keyring take a
+  // moment to come up, so the account isn't readable on the first try. Poll for
+  // it over a short window (and clear it promptly when the container stops).
+  const runningRef = useRef<boolean | undefined>(undefined);
+  useEffect(() => {
+    const running = status?.running;
+    if (running === undefined || runningRef.current === running) return;
+    runningRef.current = running;
+
+    let cancelled = false;
+    void (async () => {
+      let acc = await refreshAccount();
+      const deadline = Date.now() + 30000;
+      while (!cancelled && running && !acc && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 2500));
+        if (cancelled) break;
+        acc = await refreshAccount();
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [status?.running, refreshAccount]);
 
   const toast = (tone: ToastTone, message: string) => {
     const id = ++toastId.current;
@@ -477,6 +412,7 @@ export function App() {
       setPending((p) => ({ ...p, [key]: false }));
       refresh();
       refreshDoctor();
+      refreshAccount();
     }
   }
 
@@ -577,8 +513,8 @@ export function App() {
 
   const confirmDestroy = () => {
     const wipe = purge;
-    setDestroyOpen(false);
     setPurge(false);
+    setView("console");
     run(
       "destroy",
       () => api.destroy(wipe),
@@ -611,7 +547,12 @@ export function App() {
   const onPrimary = () => {
     if (!ready) return doEnroll();
     if (running) return run("stop", api.stop, () => "Container stopped.");
-    return run("start", api.start, () => "Container started.");
+    return run("start", api.start, (r) => {
+      const n = r.manifests.length;
+      return n > 0
+        ? `Started — browser SSO ready (${n} manifest${n === 1 ? "" : "s"}). Install the linux-entra-sso extension.`
+        : "Container started.";
+    });
   };
 
   const meta = useMemo(
@@ -652,6 +593,14 @@ export function App() {
             <Tab active={view === "logs"} onClick={() => setView("logs")}>
               Logs
             </Tab>
+            {s?.configured && (
+              <Tab
+                active={view === "destroy"}
+                onClick={() => setView("destroy")}
+              >
+                Destroy
+              </Tab>
+            )}
           </Tabs>
           <Pill hue={hue}>{copy.state}</Pill>
         </Header>
@@ -668,17 +617,38 @@ export function App() {
             onBackup={doBackup}
             onRestore={doRestore}
           />
+        ) : view === "destroy" && s?.configured ? (
+          <DestroyView
+            purge={purge}
+            onPurgeChange={setPurge}
+            onDestroy={confirmDestroy}
+            busy={busy("destroy")}
+          />
         ) : (
           <>
             <Main>
               <Col>
-                <div css={eyebrow}>Containment</div>
                 <CoreWrap>
                   <ContainmentCore phase={phase} />
                 </CoreWrap>
                 <div style={{ textAlign: "center" }}>
                   <StateWord hue={hue}>{copy.state}</StateWord>
-                  <Sub>{copy.isolation}</Sub>
+                  {running && s?.display_forwarding && (
+                    <div>
+                      <DetachBtn
+                        disabled={busy("detach")}
+                        onClick={() =>
+                          run(
+                            "detach",
+                            api.detachDisplay,
+                            () => "Resealed — back to headless.",
+                          )
+                        }
+                      >
+                        Display attached · detach
+                      </DetachBtn>
+                    </div>
+                  )}
                 </div>
 
                 <CTARow>
@@ -700,20 +670,11 @@ export function App() {
                       Open Edge
                     </Secondary>
                   </Pair>
-                  {ready && !s?.expose_bus && (
-                    <Secondary
-                      onClick={() =>
-                        run("daemon", api.daemon, (r) => {
-                          const n = r.manifests.length;
-                          return `Browser SSO ready (${n} manifest${n === 1 ? "" : "s"}). Install the linux-entra-sso extension.`;
-                        })
-                      }
-                      disabled={busy("daemon")}
-                    >
-                      Enable browser SSO
-                    </Secondary>
-                  )}
                 </CTARow>
+
+                <HealthWrap>
+                  <UserCard account={account} loading={accountLoading} />
+                </HealthWrap>
 
                 <HealthWrap>
                   <HealthPanel
@@ -726,32 +687,6 @@ export function App() {
                 </HealthWrap>
               </Col>
             </Main>
-
-            <UtilityBar>
-              <BarLabel>Actions</BarLabel>
-              {running && s?.display_forwarding && (
-                <Chip
-                  disabled={busy("detach")}
-                  onClick={() =>
-                    run(
-                      "detach",
-                      api.detachDisplay,
-                      () => "Resealed — back to headless.",
-                    )
-                  }
-                >
-                  Return to headless
-                </Chip>
-              )}
-              <Spacer />
-              <Chip
-                danger
-                disabled={!s?.configured || busy("destroy")}
-                onClick={() => setDestroyOpen(true)}
-              >
-                Destroy
-              </Chip>
-            </UtilityBar>
           </>
         )}
 
@@ -766,38 +701,6 @@ export function App() {
           onCancel={() => setPwOpen(false)}
           onSubmit={provisionAndEnroll}
         />
-      )}
-
-      {destroyOpen && (
-        <Backdrop onMouseDown={() => setDestroyOpen(false)}>
-          <Dialog
-            onMouseDown={(e) => e.stopPropagation()}
-            role="dialog"
-            aria-label="Destroy container"
-          >
-            <div css={eyebrow}>Irreversible</div>
-            <h3>Destroy the container?</h3>
-            <p>
-              This removes the container rootfs, its configuration, and the
-              browser SSO manifests. You'll need to enroll again.
-            </p>
-            <Checkbox>
-              <input
-                type="checkbox"
-                checked={purge}
-                onChange={(e) => setPurge(e.target.checked)}
-              />
-              <span>
-                Also purge enrollment data and persistent device state. Leave
-                unchecked to keep them for a future rebuild.
-              </span>
-            </Checkbox>
-            <DialogRow>
-              <Ghost onClick={() => setDestroyOpen(false)}>Cancel</Ghost>
-              <Destructive onClick={confirmDestroy}>Destroy</Destructive>
-            </DialogRow>
-          </Dialog>
-        </Backdrop>
       )}
 
       <Toasts items={toasts} />

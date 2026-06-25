@@ -1,6 +1,6 @@
 //! High-level operations — the command surface shared by both front-ends.
 //!
-//! Each function performs one user-facing operation (enroll, edge, daemon,
+//! Each function performs one user-facing operation (enroll, edge, start,
 //! stop, …) and returns structured results where a UI needs them. Interactive
 //! concerns that differ between front-ends are pushed to the caller:
 //!
@@ -229,14 +229,6 @@ pub fn stop() -> Result<()> {
     Ok(())
 }
 
-/// Start the container headless (no-op if it's already running). Used by the GUI
-/// power toggle; other flows start it implicitly via [`ensure_running`].
-pub fn start() -> Result<()> {
-    let mut config =
-        config::Config::load().context("Not set up yet. Run:  intune-container enroll")?;
-    locked_ensure_running(&mut config, false)
-}
-
 /// Open an interactive shell inside the container (terminal-only).
 pub fn shell() -> Result<()> {
     let mut config = config::Config::load().context("Failed to load configuration")?;
@@ -253,6 +245,13 @@ pub fn shell_session() -> Result<backend::ShellTarget> {
     backend::shell_target(&config)
 }
 
+/// The signed-in account for the GUI's identity panel. `Ok(None)` when the
+/// container isn't running or no account is registered. Read-only — never starts
+/// the container.
+pub fn account() -> Result<Option<crate::native_host::AccountInfo>> {
+    backend::account_info()
+}
+
 /// Detach the host display from the running container (back to headless).
 pub fn detach_display() -> Result<()> {
     let mut config = config::Config::load().context("Failed to load configuration")?;
@@ -260,18 +259,19 @@ pub fn detach_display() -> Result<()> {
     backend::detach_display(&mut config)
 }
 
-// ===== Browser SSO (daemon) =====
+// ===== Start (boot + browser SSO) =====
 
-/// What [`daemon`] installed, so the caller can report it.
+/// What [`start`] set up, so the caller can report it.
 #[derive(Debug, Clone, Serialize)]
-pub struct DaemonReport {
+pub struct StartReport {
     /// Paths of the native-messaging manifests that were written.
     pub manifests: Vec<String>,
 }
 
-/// Set up seamless browser SSO: expose the broker bus (headless), then install
-/// the native-messaging host wrapper and manifests for the detected browsers.
-pub fn daemon() -> Result<DaemonReport> {
+/// Start the container: boot it **headless** and make browser SSO ready — expose
+/// the broker bus, then install the native-messaging host wrapper and manifests
+/// for the detected browsers. Idempotent; safe to call when already running.
+pub fn start() -> Result<StartReport> {
     let mut config =
         config::Config::load().context("Not set up yet. Run:  intune-container enroll")?;
 
@@ -408,7 +408,7 @@ pub fn daemon() -> Result<DaemonReport> {
         }
     }
 
-    Ok(DaemonReport {
+    Ok(StartReport {
         manifests: installed,
     })
 }
@@ -429,7 +429,7 @@ pub fn sso_test() -> Result<()> {
     let mut config =
         config::Config::load().context("Not set up yet. Run:  intune-container enroll")?;
     if !config.expose_bus {
-        anyhow::bail!("Bus not exposed. Run:  intune-container daemon   (then retry sso-test)");
+        anyhow::bail!("Bus not exposed. Run:  intune-container start   (then retry sso-test)");
     }
     locked_ensure_running(&mut config, false)?;
     backend::sso_test(&config)
@@ -606,9 +606,9 @@ pub fn destroy(purge: bool) -> Result<DestroyOutcome> {
 }
 
 /// Remove the browser SSO native-messaging manifests and the native-host wrapper
-/// that [`daemon`] installs. Best-effort.
+/// that [`start`] installs. Best-effort.
 ///
-/// NOTE: keep this directory list in sync with [`daemon`]'s install targets.
+/// NOTE: keep this directory list in sync with [`start`]'s install targets.
 fn remove_browser_sso_integration(home: &str) {
     let manifest_dirs = [
         format!("{home}/.mozilla/native-messaging-hosts"),

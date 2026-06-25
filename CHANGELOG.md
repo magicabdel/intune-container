@@ -6,22 +6,40 @@ to follow [Semantic Versioning](https://semver.org/) once it reaches 1.0.
 
 ## [Unreleased]
 
+### Changed
+
+- Renamed the `daemon` command to **`start`**: starting the container now also
+  makes browser SSO ready (installs the native-messaging host), so "start" means
+  the same thing in the CLI, the window, and the tray.
+
+- **Rootless runtime.** The container now boots inside an unprivileged user
+  namespace via a detached supervisor (`fork` + `unshare`, multi-id mapping with
+  `newuidmap`/`newgidmap`, a delegated cgroup scope over the user's systemd
+  manager, `pivot_root`). Commands enter it with `setns`. **No host root, no
+  `sudo`, `systemd-nspawn`, `machinectl`, `nsenter`, Docker, or Podman** — the
+  image is pulled with a built-in OCI client. `destroy` leaves nothing
+  privileged behind because nothing privileged is installed.
+- The browser SSO native-host bridge runs **inside** the container (via `setns`)
+  against the container's own session bus; the host bus is no longer exposed.
+
 ### Added
 
-- **No-restart display attach**: when a GUI flow (`enroll`/`edge`) needs the
-  host display and the container is already running headless, the display,
-  audio, and GPU are bound into the running machine via `machinectl bind`
-  instead of restarting it — so a background `daemon` SSO session is no longer
-  torn down. The display is automatically detached (unmounted) again when the
-  GUI app exits, returning the container to headless isolation. New hidden
-  `detach-display` command for manual detach.
-- **System tray** (`ksni`/StatusNotifierItem, no GTK on the host): launched
-  automatically whenever the container starts, it shows running/headless/SSO
-  status and offers Open Edge, Open Portal, doctor, backup/restore, and
-  *Quit & stop container*. The tray exits on its own when the container stops;
-  quitting it via *Quit & stop* stops the container. Single-instance via a lock;
-  if no StatusNotifier host is available it logs a warning and exits without
-  affecting the container.
+- **Reworked graphical interface.** Tabbed Tauri app — Console (containment
+  state, start/stop, portal, Edge, signed-in identity, live health checks),
+  in-app Shell (a real terminal in the container), Backup/restore, Logs, and a
+  conditional Destroy tab. Status-tinted tray icon (grey/teal/amber), single-
+  click quick panel, double-click full window, and a dynamic Start/Stop menu
+  item. A single-instance plugin focuses the existing window instead of opening
+  a duplicate.
+- **Single-container guarantee**: the supervisor holds a process-lifetime
+  singleton lock, so any number of launches share one container.
+- **Hardening (headless profile)**: a private IPC namespace and cgroup memory/
+  task limits on the delegated scope.
+- **Preflight checks**: clear, actionable errors when unprivileged user
+  namespaces are disabled, no `/etc/subuid` range exists, or cgroup v2 is
+  missing.
+- **`just smoke`**: boots a real container in both profiles and `setns`-execs
+  into each — the gate for runtime/namespace changes.
 
 ## [0.1.0] - 2026-06-19
 

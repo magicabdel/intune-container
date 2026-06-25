@@ -18,8 +18,8 @@ use intune_container::{config, doctor, ops};
 #[derive(Parser)]
 #[command(
     name = "intune-container",
-    about = "Manage Microsoft Intune in a systemd-nspawn container",
-    long_about = "Manage Microsoft Intune in a systemd-nspawn container.\n\n\
+    about = "Manage Microsoft Intune in an isolated, rootless Linux container",
+    long_about = "Manage Microsoft Intune in an isolated, rootless Linux container.\n\n\
                   Run with no subcommand to open the graphical interface.",
     version
 )]
@@ -58,8 +58,9 @@ enum Command {
         #[arg(long)]
         image: Option<String>,
     },
-    /// Set up seamless browser SSO (Teams/M365 in your host browser)
-    Daemon,
+    /// Start the container headless and make browser SSO ready (Teams/M365 in
+    /// your host browser)
+    Start,
     /// Open Microsoft Edge inside the container (forwards your display)
     Edge {
         /// Run in foreground with logs visible (don't background)
@@ -171,7 +172,7 @@ fn main() -> Result<()> {
         Command::Gui => run_or_detach_gui(foreground),
         Command::Init { force, image } => cmd_init(force, image)?,
         Command::Enroll { image } => cmd_enroll(image)?,
-        Command::Daemon => cmd_daemon()?,
+        Command::Start => cmd_start()?,
         Command::Edge { verbose, args } => ops::edge(verbose, &args)?,
         Command::Stop => ops::stop()?,
         Command::Status => cmd_status()?,
@@ -321,7 +322,7 @@ fn cmd_enroll(image: Option<String>) -> Result<()> {
     let closed = ops::enroll()?;
 
     if closed {
-        eprintln!("✓ Done. Set up seamless browser SSO with:  intune-container daemon");
+        eprintln!("✓ Done. Start background browser SSO with:  intune-container start");
     } else {
         eprintln!(
             "⚠ The portal didn't open. Try again with:  intune-container enroll\n  \
@@ -331,10 +332,10 @@ fn cmd_enroll(image: Option<String>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_daemon() -> Result<()> {
-    let report = ops::daemon()?;
+fn cmd_start() -> Result<()> {
+    let report = ops::start()?;
 
-    eprintln!("✓ Native messaging host installed.");
+    eprintln!("✓ Container started. Native messaging host installed.");
     for p in &report.manifests {
         eprintln!("  {}", p);
     }
@@ -423,7 +424,7 @@ fn cmd_backup(output: Option<std::path::PathBuf>) -> Result<()> {
 fn cmd_restore(input: Option<std::path::PathBuf>) -> Result<()> {
     ops::restore(input.as_deref())?;
     eprintln!("✓ Enrollment restored. Bring the container up with:");
-    eprintln!("  intune-container daemon   (background SSO)");
+    eprintln!("  intune-container start    (background SSO)");
     eprintln!("  intune-container enroll   (if you also need the portal)");
     Ok(())
 }

@@ -8,10 +8,11 @@
 //!
 //! ## Security profiles
 //!
-//! Callers pass `hardened` to select a profile (see `SECURITY.md`):
+//! Callers pass `hardened` to select a profile, chosen automatically from
+//! whether the host display is attached:
 //!
-//! - **hardened** (daemon / headless): also unshares the IPC namespace and the
-//!   delegated scope caps memory as well as tasks.
+//! - **hardened** (headless): also unshares the IPC namespace and the delegated
+//!   scope caps memory as well as tasks.
 //! - **compat** (interactive GUI): keeps the host IPC namespace so XWayland's
 //!   MIT-SHM works for forwarded GUI apps; the scope caps tasks only.
 //!

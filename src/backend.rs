@@ -263,6 +263,45 @@ pub fn native_host(_config: &Config) -> Result<()> {
     Ok(())
 }
 
+/// Query the broker for the signed-in account, surfaced to the GUI. Runs the
+/// query **inside** the container (via `setns`) and pipes the JSON result back
+/// out. `Ok(None)` when the container isn't running or no account is registered.
+pub fn account_info() -> Result<Option<crate::native_host::AccountInfo>> {
+    let Some(leader) = runtime::running_leader()? else {
+        return Ok(None);
+    };
+    let mut fds = [0i32; 2];
+    if unsafe { nix::libc::pipe(fds.as_mut_ptr()) } != 0 {
+        anyhow::bail!("pipe() failed");
+    }
+    let (r, w) = (fds[0], fds[1]);
+    runtime::run_in_container(leader, Some(0), &broker_bridge_env(), move || {
+        unsafe { nix::libc::close(r) };
+        if let Ok(Some(acc)) = crate::native_host::accounts_blocking(Path::new(BROKER_BUS)) {
+            if let Ok(s) = serde_json::to_string(&acc) {
+                let _ = unsafe { nix::libc::write(w, s.as_ptr() as *const _, s.len()) };
+            }
+        }
+        unsafe { nix::libc::close(w) };
+        0
+    })?;
+    unsafe { nix::libc::close(w) };
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 4096];
+    loop {
+        let n = unsafe { nix::libc::read(r, tmp.as_mut_ptr() as *mut _, tmp.len()) };
+        if n <= 0 {
+            break;
+        }
+        buf.extend_from_slice(&tmp[..n as usize]);
+    }
+    unsafe { nix::libc::close(r) };
+    if buf.is_empty() {
+        return Ok(None);
+    }
+    Ok(serde_json::from_slice(&buf).ok())
+}
+
 /// Query the broker directly (SSO debugging), from inside the container.
 pub fn sso_test(_config: &Config) -> Result<()> {
     let leader = runtime::running_leader()?.context("container is not running")?;
@@ -324,7 +363,8 @@ pub fn supervise_main(with_display: bool) -> Result<i32> {
 
     let log = boot_log();
     // Headless (no display forwarded) selects the hardened security profile;
-    // an attached display selects the compat profile (see SECURITY.md).
+    // an attached display selects the compat profile (see the profiles in
+    // `runtime`).
     let hardened = !with_display;
     let container =
         runtime::start_systemd(&rootfs, &binds, Some(&log), hardened).context("start_systemd")?;

@@ -25,21 +25,28 @@ export interface Check {
   detail: string;
 }
 
-/** Mirrors `intune_container::ops::DaemonReport`. */
-export interface DaemonReport {
+/** Mirrors `intune_container::native_host::AccountInfo`. */
+export interface Account {
+  name: string;
+  username: string;
+  tenant: string;
+}
+
+/** Mirrors `intune_container::ops::StartReport`. */
+export interface StartReport {
   manifests: string[];
 }
 
 export const api = {
   getStatus: () => invoke<StatusReport>("get_status"),
   getDoctor: () => invoke<Check[]>("get_doctor"),
+  getAccount: () => invoke<Account | null>("get_account"),
   isInitialized: () => invoke<boolean>("is_initialized"),
   init: (password: string) => invoke<void>("init", { password }),
   enroll: () => invoke<boolean>("enroll"),
   edge: () => invoke<void>("edge"),
-  daemon: () => invoke<DaemonReport>("daemon"),
   stop: () => invoke<void>("stop"),
-  start: () => invoke<void>("start"),
+  start: () => invoke<StartReport>("start"),
   detachDisplay: () => invoke<void>("detach_display"),
   backup: (path?: string) => invoke<string>("backup", { path: path ?? null }),
   restore: (path?: string) => invoke<void>("restore", { path: path ?? null }),
@@ -68,7 +75,7 @@ export const PHASE_COPY: Record<Phase, { state: string; isolation: string }> = {
     isolation: "Powered off. Start it to check in with Intune.",
   },
   sealed: {
-    state: "Sealed",
+    state: "Running",
     isolation: "Running headless — isolated from your desktop.",
   },
   open: {
