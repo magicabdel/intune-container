@@ -59,7 +59,8 @@ fn lock_path() -> Result<PathBuf> {
     Ok(data_dir.join("intune-container").join("lifecycle.lock"))
 }
 
-/// A held single-instance lock for a background helper (currently the tray).
+/// A held single-instance lock for a long-lived process (the container
+/// supervisor; the GUI uses `tauri-plugin-single-instance` instead).
 ///
 /// Unlike [`LifecycleLock`], this is acquired non-blocking and held for the
 /// whole lifetime of the holding process: if another instance already holds it,
@@ -95,4 +96,26 @@ fn singleton_lock_path(name: &str) -> Result<PathBuf> {
     Ok(data_dir
         .join("intune-container")
         .join(format!("{name}.lock")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SingletonLock;
+
+    /// The supervisor relies on this: a second holder must be denied while the
+    /// first is alive, so a racing supervisor can't boot a duplicate container.
+    #[test]
+    fn singleton_lock_denies_a_second_holder_then_frees_on_drop() {
+        let name = "test-singleton-mutex";
+
+        let first = SingletonLock::try_acquire(name).unwrap();
+        assert!(first.is_some(), "first acquire should succeed");
+
+        let second = SingletonLock::try_acquire(name).unwrap();
+        assert!(second.is_none(), "second acquire must be denied while held");
+
+        drop(first);
+        let third = SingletonLock::try_acquire(name).unwrap();
+        assert!(third.is_some(), "acquire should succeed after release");
+    }
 }

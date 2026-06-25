@@ -383,6 +383,12 @@ fn build_tray(app: &AppHandle) -> bool {
 /// Run the Tauri interface. Blocks until the app exits.
 pub fn run() {
     tauri::Builder::default()
+        // Must be registered FIRST. A second `intune-container` launch focuses the
+        // existing window (showing it from the tray) instead of starting a
+        // duplicate instance; the second process then exits.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            show_main_window(app);
+        }))
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             get_status,

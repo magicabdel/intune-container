@@ -19,6 +19,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
 use crate::display::DisplayInfo;
+use crate::lock::SingletonLock;
 use crate::provision::{self, ContainerUser};
 use crate::runtime;
 
@@ -262,6 +263,31 @@ pub fn sso_test(_config: &Config) -> Result<()> {
 /// Body of `__rootless-supervise`: boot systemd, publish state, stay alive to
 /// reap PID 1. Returns the container's exit code.
 pub fn supervise_main(with_display: bool) -> Result<i32> {
+    // Hard singleton: at most one supervisor — hence one container — may run.
+    // The lock is held for this process's whole life and released on exit. A
+    // second supervisor (spawned by a racing `start()`, a boot-timeout retry, or
+    // stale runtime state) finds the lock held and exits without booting a
+    // duplicate. We retry briefly so a legitimate restart (the previous
+    // supervisor still releasing the lock as its container powers off) is not
+    // mistaken for a live duplicate.
+    let mut held = None;
+    for _ in 0..30 {
+        match SingletonLock::try_acquire("supervisor")? {
+            Some(l) => {
+                held = Some(l);
+                break;
+            }
+            None => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+    let _singleton = match held {
+        Some(l) => l,
+        None => {
+            info!("another container supervisor is already running; not booting a duplicate");
+            return Ok(0);
+        }
+    };
+
     let mut config = Config::load().context("load config in supervisor")?;
     let rootfs = rootless_rootfs(&config);
     config.rootfs_path = rootfs.clone();

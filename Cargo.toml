@@ -54,6 +54,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 # Native file open/save dialogs (backup destination / restore source).
 tauri-plugin-dialog = "2"
+# Ensures a second launch focuses the existing window instead of starting a
+# duplicate GUI/tray instance (DBus-based on Linux).
+tauri-plugin-single-instance = "2"
 
 # --- Rootless runtime ---
 # Pull OCI images without docker/podman, and extract layers without `tar`.
