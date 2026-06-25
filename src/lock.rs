@@ -58,3 +58,64 @@ fn lock_path() -> Result<PathBuf> {
         .context("Neither XDG_DATA_HOME nor HOME is set")?;
     Ok(data_dir.join("intune-container").join("lifecycle.lock"))
 }
+
+/// A held single-instance lock for a long-lived process (the container
+/// supervisor; the GUI uses `tauri-plugin-single-instance` instead).
+///
+/// Unlike [`LifecycleLock`], this is acquired non-blocking and held for the
+/// whole lifetime of the holding process: if another instance already holds it,
+/// [`SingletonLock::try_acquire`] returns `Ok(None)` so the caller can exit
+/// quietly instead of running a duplicate.
+pub struct SingletonLock {
+    _flock: Flock<File>,
+}
+
+impl SingletonLock {
+    /// Try to acquire the named singleton lock without blocking. Returns
+    /// `Ok(None)` if another process already holds it.
+    pub fn try_acquire(name: &str) -> Result<Option<Self>> {
+        let path = singleton_lock_path(name)?;
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let file = File::create(&path)
+            .with_context(|| format!("Failed to open lock file {}", path.display()))?;
+
+        match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+            Ok(flock) => Ok(Some(Self { _flock: flock })),
+            Err(_) => Ok(None),
+        }
+    }
+}
+
+fn singleton_lock_path(name: &str) -> Result<PathBuf> {
+    let data_dir = std::env::var("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|_| std::env::var("HOME").map(|home| PathBuf::from(home).join(".local/share")))
+        .context("Neither XDG_DATA_HOME nor HOME is set")?;
+    Ok(data_dir
+        .join("intune-container")
+        .join(format!("{name}.lock")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SingletonLock;
+
+    /// The supervisor relies on this: a second holder must be denied while the
+    /// first is alive, so a racing supervisor can't boot a duplicate container.
+    #[test]
+    fn singleton_lock_denies_a_second_holder_then_frees_on_drop() {
+        let name = "test-singleton-mutex";
+
+        let first = SingletonLock::try_acquire(name).unwrap();
+        assert!(first.is_some(), "first acquire should succeed");
+
+        let second = SingletonLock::try_acquire(name).unwrap();
+        assert!(second.is_none(), "second acquire must be denied while held");
+
+        drop(first);
+        let third = SingletonLock::try_acquire(name).unwrap();
+        assert!(third.is_some(), "acquire should succeed after release");
+    }
+}

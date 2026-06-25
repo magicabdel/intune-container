@@ -36,6 +36,34 @@ jobs:
       # Caches ~/.cargo and ./target keyed on Cargo.lock; big speedup on reruns.
       - uses: Swatinem/rust-cache@v2
 
+      # The GUI links against WebKitGTK/GTK at build time (tauri, webkit2gtk,
+      # libsoup, libayatana-appindicator → glib-sys). Without these -dev
+      # packages the build fails at `glib-sys` with "glib-2.0 was not found".
+      - name: Install GUI system libraries (Tauri v2)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libsoup-3.0-dev \
+            build-essential pkg-config
+
+      # tauri-build (build.rs) requires the compiled frontend at `frontend/dist`
+      # to exist before any cargo step, so build it first.
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend
+        run: |
+          npm --prefix frontend ci
+          npm --prefix frontend run build
+
       - name: Format
         run: cargo fmt --all --check
 

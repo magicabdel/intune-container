@@ -1,0 +1,41 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Intune Container",
+  "version": "0.2.0",
+  "identifier": "dev.zaimi.intunecontainer",
+  "build": {
+    "frontendDist": "frontend/dist",
+    "beforeBuildCommand": "npm --prefix frontend install && npm --prefix frontend run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Intune Container",
+        "width": 940,
+        "height": 700,
+        "minWidth": 720,
+        "minHeight": 520,
+        "resizable": true,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "category": "Utility",
+    "shortDescription": "Manage Microsoft Intune in a systemd-nspawn container",
+    "longDescription": "Desktop interface for intune-container: start/stop the container, enroll, open Edge, set up browser SSO, run health checks and manage enrollment backups — all from a tray-resident window.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico",
+      "icons/icon.png"
+    ]
+  }
+}

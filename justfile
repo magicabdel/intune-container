@@ -5,13 +5,18 @@
 default:
     @just --list
 
-# Build the project in release mode
-build:
+# Build the binary (GUI + CLI) in release mode. Builds the TypeScript/Emotion
+# frontend first, since Tauri embeds it into the binary at compile time.
+build: frontend
     cargo build --release
+
+# Build the TypeScript + Emotion frontend (requires Node.js + npm)
+frontend:
+    cd frontend && npm install && npm run build
 
 # Build the derived container image (base + xvfb) locally for testing.
 # Prefers `docker`, falls back to `podman`. Push the result to your registry,
-# then hardcode that URL as DEFAULT_IMAGE in src/init.rs.
+# then hardcode that URL as DEFAULT_IMAGE in src/backend.rs.
 build-image:
     #!/usr/bin/env sh
     set -e
@@ -28,9 +33,17 @@ build-image:
     echo "  Test:  intune-container init --force --image localhost/intune-container:local"
     echo "  Push:  $engine tag localhost/intune-container:local <registry>/intune-container:latest && $engine push <registry>/intune-container:latest"
 
-# Run tests
+# Run tests (library unit tests; no frontend build required)
 test:
-    cargo test
+    cargo test --lib
+
+# Boot smoke test — RUN BEFORE MERGING ANY runtime/namespace/cgroup change.
+# Boots a real container in BOTH profiles and `setns`-execs into each. Unit tests
+# can't catch this class of bug (they never boot); the compat/hardened IPC-join
+# EPERM regression that silently broke compliance would have been caught here.
+# Needs the cached rootfs (auto-extracted on first run) + a user systemd manager.
+smoke:
+    cargo test --lib -- --ignored --nocapture exec_in_running_container exec_in_hardened_container
 
 # Run clippy lints
 lint:
@@ -40,19 +53,21 @@ lint:
 fmt:
     cargo fmt
 
-# Install the binary to ~/.local/bin (no sudo needed)
+# Install the binary to ~/.local/bin. It opens the GUI when run with no
+# subcommand, and acts as the CLI for any subcommand (enroll, edge, …).
 install: build
     install -Dm755 target/release/intune-container ~/.local/bin/intune-container
     @echo "✓ Installed to ~/.local/bin/intune-container"
-    @echo "  Ensure ~/.local/bin is on your PATH, then:  intune-container enroll"
+    @echo "  Open the interface:  intune-container        (no subcommand = GUI)"
+    @echo "  Or use the CLI:       intune-container enroll"
 
 # Uninstall the binary (run `intune-container destroy` first for full cleanup)
 uninstall:
     rm -f ~/.local/bin/intune-container
     @echo "✓ Removed ~/.local/bin/intune-container"
-    @echo "  Note: this removes only the binary. To also remove the container,"
-    @echo "  sudoers rule, nsenter helper and browser manifests, run"
-    @echo "  'intune-container destroy' BEFORE uninstalling."
+    @echo "  Note: this removes only the binary. To also remove the container"
+    @echo "  and its enrollment store, run 'intune-container destroy --purge'"
+    @echo "  BEFORE uninstalling (or destroy from the GUI)."
 
 # Clean build artifacts
 clean:
@@ -75,14 +90,14 @@ changelog:
 # NOTE: not for the first release — v0.1.0's changelog is hand-written.
 changelog-release version:
     @command -v git-cliff >/dev/null 2>&1 || { echo "git-cliff not found. Install with:  cargo install git-cliff   (or: pacman -S git-cliff)"; exit 1; }
-    git cliff --unreleased --tag {{version}} --prepend CHANGELOG.md
+    git cliff --unreleased --tag {{ version }} --prepend CHANGELOG.md
 
 # Cut a release: stamp the changelog, commit, tag, and push the tag.
 # Bump the version in Cargo.toml first, then run e.g. `just release v0.2.0`.
 # For the FIRST release (v0.1.0), skip this — see the README/CONTRIBUTING notes.
 release version:
-    just changelog-release {{version}}
+    just changelog-release {{ version }}
     git add CHANGELOG.md
-    git commit -m "chore(release): {{version}}"
-    git tag -a {{version}} -m "{{version}}"
-    @echo "Tagged {{version}}. Push with:  git push && git push origin {{version}}"
+    git commit -m "chore(release): {{ version }}"
+    git tag -a {{ version }} -m "{{ version }}"
+    @echo "Tagged {{ version }}. Push with:  git push && git push origin {{ version }}"

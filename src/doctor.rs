@@ -1,20 +1,24 @@
 //! `doctor` — health checks for the whole stack.
 //!
-//! Verifies the things that have bitten us before: config, container, DNS,
-//! device registration persistence, keyring, broker services, bus exposure,
-//! browser SSO integration, and backups. Each check prints a status line.
+//! Focused on the signals that can fail silently and that the user cares about:
+//! enrollment/registration drift, the container being up, network reach, the
+//! identity broker, the keyring, and the compliance agent. Cosmetic facts
+//! (display mode, SSO, host) are surfaced elsewhere in the UI, not here.
+//!
+//! [`collect`] returns the checks as structured data (used by the GUI); [`run`]
+//! prints them as status lines (used by the CLI).
 
-use std::path::Path;
-use std::process::Command;
+use std::path::PathBuf;
 
 use anyhow::Result;
+use serde::Serialize;
 
-use crate::backup;
+use crate::backend;
 use crate::config::Config;
-use crate::container;
 
-#[derive(Clone, Copy)]
-enum Status {
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Status {
     Ok,
     Warn,
     Fail,
@@ -32,202 +36,175 @@ impl Status {
     }
 }
 
-fn line(status: Status, label: &str, detail: &str) {
-    if detail.is_empty() {
-        println!("  {} {}", status.glyph(), label);
-    } else {
-        println!("  {} {} — {}", status.glyph(), label, detail);
+/// A single health-check result.
+#[derive(Clone, Serialize)]
+pub struct Check {
+    pub status: Status,
+    pub label: String,
+    pub detail: String,
+}
+
+impl Check {
+    fn new(status: Status, label: &str, detail: &str) -> Self {
+        Check {
+            status,
+            label: label.to_string(),
+            detail: detail.to_string(),
+        }
     }
 }
 
-/// Run all health checks. Returns Ok always; problems are reported as lines.
+/// Run all health checks and return them as structured results.
+///
+/// Never errors: a missing configuration is itself reported as a failing check.
+pub fn collect() -> Vec<Check> {
+    let mut checks = Vec::new();
+
+    // Setup gate: nothing else matters until the container is provisioned.
+    let config = match Config::load() {
+        Ok(c) if c.initialized => c,
+        _ => {
+            checks.push(Check::new(
+                Status::Fail,
+                "Setup",
+                "not set up — enroll this device to begin",
+            ));
+            return checks;
+        }
+    };
+
+    // Registration drift: a registration the agent flagged for repair is the
+    // "stuck re-enrolling → non-compliant" state that has bitten us before.
+    let reg = persist_dir().join("home/config-intune/registration.toml");
+    match std::fs::read_to_string(&reg) {
+        Ok(s) if s.contains("needs_patching = \"true\"") => checks.push(Check::new(
+            Status::Warn,
+            "Registration",
+            "needs patching (device-identity drift) — re-enroll if non-compliant",
+        )),
+        Ok(_) => checks.push(Check::new(Status::Ok, "Registration", "device enrolled")),
+        Err(_) => checks.push(Check::new(
+            Status::Skip,
+            "Registration",
+            "no registration recorded yet",
+        )),
+    }
+
+    // Live checks need a running container.
+    if !backend::is_running(&config) {
+        checks.push(Check::new(
+            Status::Warn,
+            "Container",
+            "stopped — start it to check in with Intune",
+        ));
+        return checks;
+    }
+    checks.push(Check::new(Status::Ok, "Container", "running"));
+
+    // Network reach to the Microsoft endpoints (from inside the container).
+    if backend::probe(&config, "getent hosts login.microsoftonline.com >/dev/null") == 0 {
+        checks.push(Check::new(
+            Status::Ok,
+            "Network",
+            "Microsoft endpoints reachable",
+        ));
+    } else {
+        checks.push(Check::new(
+            Status::Fail,
+            "Network",
+            "can't resolve login.microsoftonline.com",
+        ));
+    }
+
+    // The identity broker — the core service everything else relies on.
+    if backend::probe(
+        &config,
+        "systemctl is-active --quiet microsoft-identity-device-broker.service",
+    ) == 0
+    {
+        checks.push(Check::new(Status::Ok, "Identity broker", "active"));
+    } else {
+        checks.push(Check::new(Status::Warn, "Identity broker", "not active"));
+    }
+
+    // Keyring unlocked (holds the device key; locked → broker can't store secrets).
+    let keyring_unlocked = "export XDG_RUNTIME_DIR=/run/user/0 \
+         DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus; \
+         [ \"$(busctl --user get-property org.freedesktop.secrets \
+           /org/freedesktop/secrets/collection/login \
+           org.freedesktop.Secret.Collection Locked 2>/dev/null)\" = \"b false\" ]";
+    match backend::probe(&config, keyring_unlocked) {
+        0 => checks.push(Check::new(Status::Ok, "Keyring", "unlocked")),
+        _ => checks.push(Check::new(Status::Skip, "Keyring", "locked or unknown")),
+    }
+
+    // Compliance agent: the timer must be scheduled (not masked/stopped), or the
+    // device silently drifts to non-compliant. (Whether the *last* run passed is
+    // deliberately not shown — it's transiently "failed" right after a boot.)
+    let env =
+        "export XDG_RUNTIME_DIR=/run/user/0 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus;";
+    let masked = backend::probe(
+        &config,
+        &format!(
+            "{env} [ \"$(systemctl --user is-enabled intune-agent.timer 2>/dev/null)\" = masked ]"
+        ),
+    ) == 0;
+    let active = backend::probe(
+        &config,
+        &format!("{env} systemctl --user is-active --quiet intune-agent.timer"),
+    ) == 0;
+    if masked {
+        checks.push(Check::new(
+            Status::Fail,
+            "Compliance agent",
+            "disabled — device won't report compliant; re-enroll",
+        ));
+    } else if active {
+        checks.push(Check::new(Status::Ok, "Compliance agent", "scheduled"));
+    } else {
+        checks.push(Check::new(
+            Status::Warn,
+            "Compliance agent",
+            "not scheduled",
+        ));
+    }
+
+    checks
+}
+
+/// Run all health checks and print them as status lines. Returns Ok always;
+/// problems are reported as lines.
 pub fn run() -> Result<()> {
     println!("=== intune-container doctor ===\n");
 
-    // --- Config / setup ---
-    let config = match Config::load() {
-        Ok(c) => c,
-        Err(_) => {
-            line(
-                Status::Fail,
-                "Configuration",
-                "not found — run: intune-container enroll",
-            );
-            return Ok(());
-        }
-    };
-    line(Status::Ok, "Configuration", "loaded");
-
-    if config.initialized {
-        line(Status::Ok, "Initialized", "rootfs provisioned");
-    } else {
-        line(Status::Fail, "Initialized", "run: intune-container enroll");
-    }
-
-    // --- Host-side persistent state (survives rebuilds) ---
-    let state_dir = container::persistent_state_dir();
-    let device_dir = format!("{}/device-broker", state_dir);
-    match dir_has_content_sudo(&device_dir) {
-        Some(true) => line(
-            Status::Ok,
-            "Device registration",
-            "present (persisted on host)",
-        ),
-        Some(false) => line(
-            Status::Warn,
-            "Device registration",
-            "empty — enroll with: intune-container enroll",
-        ),
-        None => line(
-            Status::Warn,
-            "Device registration",
-            "could not read (run with sudo?)",
-        ),
-    }
-
-    // Keyring (tokens) on the host
-    let keyring = format!(
-        "{}/Intune/.local/share/keyrings/login.keyring",
-        std::env::var("HOME").unwrap_or_default()
-    );
-    if Path::new(&keyring).exists() {
-        let size = std::fs::metadata(&keyring).map(|m| m.len()).unwrap_or(0);
-        line(
-            Status::Ok,
-            "Keyring (tokens)",
-            &format!("present ({} KB)", size / 1024),
-        );
-    } else {
-        line(
-            Status::Warn,
-            "Keyring (tokens)",
-            "none yet — created on first sign-in",
-        );
-    }
-
-    // --- Display detection ---
-    line(
-        Status::Ok,
-        "Display mode",
-        if config.display_forwarding {
-            "forwarding on (GUI works)"
+    let checks = collect();
+    for c in &checks {
+        if c.detail.is_empty() {
+            println!("  {} {}", c.status.glyph(), c.label);
         } else {
-            "headless (max isolation)"
-        },
-    );
-
-    // --- Browser SSO integration (host-side files) ---
-    let manifest = format!(
-        "{}/.mozilla/native-messaging-hosts/linux_entra_sso.json",
-        std::env::var("HOME").unwrap_or_default()
-    );
-    if config.expose_bus && Path::new(&manifest).exists() {
-        line(
-            Status::Ok,
-            "Browser SSO",
-            "native host installed + bus exposed",
-        );
-    } else if Path::new(&manifest).exists() {
-        line(
-            Status::Warn,
-            "Browser SSO",
-            "manifest present but bus not exposed — run: intune-container daemon",
-        );
-    } else {
-        line(
-            Status::Skip,
-            "Browser SSO",
-            "not set up (optional) — run: intune-container daemon",
-        );
-    }
-
-    // --- Backup ---
-    match backup::default_backup_path() {
-        Ok(p) if p.exists() => {
-            let size = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
-            line(
-                Status::Ok,
-                "Backup",
-                &format!("{} ({} KB)", p.display(), size / 1024),
-            );
+            println!("  {} {} — {}", c.status.glyph(), c.label, c.detail);
         }
-        _ => line(
-            Status::Skip,
-            "Backup",
-            "none — run: intune-container backup",
-        ),
     }
 
-    // --- Container runtime checks ---
-    let running = container::is_running(&config.machine_name);
-    if !running {
-        line(
-            Status::Warn,
-            "Container",
-            "not running — start it for live checks",
-        );
+    // Hint when live checks were skipped because the container is down.
+    let container_down = checks
+        .iter()
+        .any(|c| c.label == "Container" && matches!(c.status, Status::Warn));
+    if container_down {
         println!("\nStart the container and re-run `doctor` for DNS/broker checks.");
-        return Ok(());
-    }
-    line(Status::Ok, "Container", "running");
-
-    // DNS (inside container)
-    match container::run_in_container(
-        &config.machine_name,
-        &config.host_user,
-        "getent hosts login.microsoftonline.com >/dev/null && echo ok || echo fail",
-    ) {
-        Ok(s) if s.contains("ok") => line(Status::Ok, "DNS", "login.microsoftonline.com resolves"),
-        _ => line(Status::Fail, "DNS", "resolution failed inside container"),
+    } else {
+        println!("\nAll checks complete.");
     }
 
-    // Device broker service
-    match container::run_in_container(
-        &config.machine_name,
-        &config.host_user,
-        "systemctl is-active microsoft-identity-device-broker 2>/dev/null || sudo systemctl is-active microsoft-identity-device-broker 2>/dev/null || echo unknown",
-    ) {
-        Ok(s) if s.contains("active") => line(Status::Ok, "Device broker", "active"),
-        _ => line(Status::Warn, "Device broker", "not confirmed active"),
-    }
-
-    // Keyring unlocked?
-    match container::run_in_container(
-        &config.machine_name,
-        &config.host_user,
-        "busctl --user get-property org.freedesktop.secrets /org/freedesktop/secrets/collection/login org.freedesktop.Secret.Collection Locked 2>/dev/null || echo unknown",
-    ) {
-        Ok(s) if s.contains("false") => line(Status::Ok, "Keyring", "unlocked"),
-        Ok(s) if s.contains("true") => line(Status::Warn, "Keyring", "locked — broker can't read tokens"),
-        _ => line(Status::Skip, "Keyring", "lock state unknown"),
-    }
-
-    // Bus exposure socket
-    if config.expose_bus {
-        match config.broker_bus_path() {
-            Ok(bus) if bus.exists() => line(Status::Ok, "SSO bus", "container session bus exposed"),
-            Ok(_) => line(
-                Status::Warn,
-                "SSO bus",
-                "socket missing — restart the container",
-            ),
-            Err(e) => line(Status::Warn, "SSO bus", &format!("path unavailable: {e}")),
-        }
-    }
-
-    println!("\nAll checks complete.");
     Ok(())
 }
 
-/// Check whether a root-owned directory has any content (using sudo).
-/// Returns Some(true/false) or None if it couldn't be read.
-fn dir_has_content_sudo(dir: &str) -> Option<bool> {
-    let output = Command::new("sudo")
-        .args(["sh", "-c", &format!("ls -A {} 2>/dev/null | head -1", dir)])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(!output.stdout.is_empty())
+/// The rootless persistence store (`~/.local/share/intune-container/persist`).
+fn persist_dir() -> PathBuf {
+    std::env::var("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("intune-container")
+        .join("persist")
 }

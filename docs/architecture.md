@@ -1,45 +1,58 @@
 # Architecture
 
-`intune-container` is a host-side Rust CLI that drives a single
-`systemd-nspawn` machine named `intune`. The CLI never reimplements Microsoft's
-components — it provisions the container, controls its boot mode, and bridges
-just enough to the host for the portal UI and browser SSO.
+`intune-container` is a host-side Rust program that runs a single, **rootless**
+container — the rootfs's `systemd` booted inside an unprivileged user namespace,
+with no host root. It never reimplements Microsoft's components; it provisions
+the container, controls its boot mode, and bridges just enough to the host for
+the portal UI and browser SSO.
 
 ## Components
 
 ```mermaid
 flowchart TB
-    subgraph host[Host]
-        CLI[intune-container CLI]
+    subgraph host[Host - your user, no root]
+        APP[intune-container GUI / CLI]
+        SUP[detached supervisor]
         NH[native-host bridge]
         EXT[Browser + linux-entra-sso]
         XW[Wayland / XWayland]
     end
 
-    subgraph ctr[systemd-nspawn machine: intune]
-        SD[systemd]
+    subgraph ctr[Rootless container - user namespace]
+        SD[systemd PID 1]
         DB[microsoft-identity-device-broker]
-        ID[intune-daemon]
-        APP[intune-portal / edge]
+        ID[intune agent]
+        APPW[intune-portal / edge]
         XV[Xvfb :99 headless display]
     end
 
-    CLI -->|sudo systemd-nspawn| SD
-    CLI -->|nsenter helper| APP
-    APP --> ID --> DB
-    APP -. display mode .-> XW
-    DB -. headless mode .-> XV
+    APP -->|spawn| SUP
+    SUP -->|fork + unshare userns| SD
+    APP -->|setns| APPW
+    APPW --> ID --> DB
+    APPW -. display attached .-> XW
+    DB -. headless .-> XV
     EXT --> NH
-    NH -->|D-Bus over exposed bus socket| DB
+    NH -->|setns + D-Bus on the container bus| DB
 ```
 
-- The **CLI** boots the machine (`sudo systemd-nspawn`) and launches GUI apps
-  through a small, root-owned **nsenter helper** authorized by a single
-  passwordless sudoers rule.
-- The **native-host bridge** is the same binary in `native-host` mode, spawned
-  by the browser. It speaks the `linux-entra-sso` native-messaging protocol and
-  forwards to the container's identity broker over the exposed session bus.
-- Enrollment state lives on the **host** (bind mounts), so it survives rebuilds.
+- The **GUI/CLI** spawn a detached **supervisor** process that `fork`s, creates
+  an unprivileged user namespace (`unshare(CLONE_NEWUSER|NEWNS|NEWPID|NEWUTS)`,
+  multi-id mapped via `newuidmap`/`newgidmap`), gets a **delegated cgroup scope**
+  from the user's systemd manager over D-Bus, `pivot_root`s into the rootfs, and
+  `exec`s the rootfs's `/sbin/init`. No host root, no `sudo`.
+- Other commands **enter** the running container with `setns` (joining its
+  user/mount/pid/… namespaces) — there is no `nsenter` helper and no setuid
+  binary.
+- The **native-host bridge** is the same binary, spawned by the browser. It
+  `setns`-enters the container and speaks the `linux-entra-sso` native-messaging
+  protocol to the identity broker on the container's **own** session bus — the
+  host bus is never exposed.
+- In-container apps run as the container's **root**, which the id-map points at
+  your unprivileged host user, so host-owned resources (the Wayland socket, the
+  persistence store) are reachable and anything created stays owned by you.
+- Enrollment state lives in a **persistent store outside the rootfs**, bound in
+  at boot, so it survives rebuilds.
 
 ## Enroll flow
 
@@ -47,69 +60,79 @@ flowchart TB
 sequenceDiagram
     actor U as You
     participant C as intune-container
-    participant M as nspawn (intune)
+    participant M as rootless container
     participant P as intune-portal
-    participant D as intune-daemon
     participant B as device-broker
 
-    U->>C: intune-container enroll
-    C->>M: boot (display forwarding ON)
-    C->>M: wait until boot complete
-    C->>P: launch (host IPC ns, real display)
-    P->>D: connect /run/intune/daemon.socket
-    D->>B: device registration over D-Bus
+    U->>C: enroll (or "Enroll this device")
+    C->>M: boot with the host display attached
+    C->>M: wait until services are ready
+    C->>P: launch (setns, real display)
+    P->>B: device registration over D-Bus
     P-->>U: sign-in window
     U->>P: sign in, enroll, close window
-    C-->>U: Done
+    C-->>U: Done (container returns to headless)
 ```
 
-The portal renders with X shared memory (MIT-SHM) against the host's X server,
-so display GUI apps run in the **host IPC namespace** (the nsenter helper drops
-`-i`); otherwise they crash with an X11 `BadAccess`. The headless path keeps the
-container's private IPC namespace.
+GUI apps render with X shared memory (MIT-SHM) against the host's X server, so
+the **display profile keeps the host IPC namespace shared** (a private IPC ns
+makes the host X server unable to attach the container's shared-memory segment →
+an X11 `BadAccess`). The **headless profile** uses a private IPC namespace.
 
 ## Headless browser SSO
 
 ```mermaid
 sequenceDiagram
     participant E as Browser extension
-    participant N as native-host (host)
-    participant S as Container session bus
+    participant N as native-host (setns into container)
     participant B as Identity broker (Xvfb)
 
     E->>N: getAccounts / acquirePrtSsoCookie
-    N->>S: D-Bus call
-    S->>B: activate broker (private Xvfb display)
+    N->>B: D-Bus call on the container session bus
     B-->>N: PRT SSO cookie
     N-->>E: cookie for login.microsoftonline.com
 ```
 
 ## Display / boot modes
 
-There is one machine; its mode is fixed at boot (bind mounts can't change on a
-running machine), so switching modes **reboots** it. Enrollment state persists
-across reboots; a running session of the other mode does not.
+There is one container; the display sockets are bound at boot (and the IPC
+profile is fixed there), so attaching or detaching the host display currently
+**restarts** it. Enrollment state persists across restarts. Headless is the
+default; the display is attached only for the portal and Edge, and detached
+again when those close.
 
 ```mermaid
 stateDiagram-v2
     [*] --> Stopped
-    Stopped --> Headless: daemon (background SSO)
+    Stopped --> Headless: start (boot + SSO)
     Stopped --> Display: enroll / edge
-    Headless --> Display: enroll / edge (reboot)
-    Display --> Headless: daemon (reboot)
+    Headless --> Display: enroll / edge (restart)
+    Display --> Headless: detach / GUI closed (restart)
     Display --> Stopped: stop
     Headless --> Stopped: stop
 ```
 
+## Single instance & lifecycle
+
+- The **supervisor** holds a process-lifetime singleton lock, so however many
+  times you launch the app, there is **at most one** running container.
+- A cross-process **lifecycle lock** serializes boot/stop so concurrent commands
+  (including the browser-spawned native host) can't race.
+- The GUI uses `tauri-plugin-single-instance`: a second launch focuses the
+  existing window instead of starting a duplicate.
+
 ## Isolation model
 
-- **Display:** headless by default; the real display + GPU are bound only for
-  `enroll`/`edge`.
-- **Filesystem:** the container has its own rootfs; only `~/Intune`, the
-  device-state dirs, and (for SSO) a bus-socket directory are bind mounted.
-- **Network:** **shared with the host** (no `--private-network`). The container
-  can reach `localhost` services and host-local abstract sockets regardless of
-  display mode. This is the main isolation gap — see the [Roadmap](roadmap.md).
-
-For the full trust model (the passwordless helper, the host IPC namespace for
-display apps, token storage), see `SECURITY.md` in the repository.
+- **Display:** headless by default; the real display is bound only for the
+  portal and Edge.
+- **Filesystem:** the container has its own rootfs; only the display sockets and
+  the persistence store are bound in.
+- **IPC:** private in the headless profile; shared with the host in the display
+  profile (required for XWayland MIT-SHM).
+- **Network:** **shared with the host.** The container reaches `localhost`
+  services and host-local abstract sockets regardless of display mode. This is
+  the main isolation gap — see the [Roadmap](roadmap.md).
+- **Privilege:** rootless. The container's "root" maps to your unprivileged host
+  user, so the container is **not** a privilege boundary beyond your own account
+  — it keeps the Intune agent off your host, but a process that escapes it has
+  whatever access your user has (shared network included).
