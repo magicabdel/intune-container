@@ -15,7 +15,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
 use crate::display::DisplayInfo;
@@ -469,11 +469,37 @@ pub fn probe(config: &Config, script: &str) -> i32 {
 fn prepare_session(config: &Config, headless: bool) {
     let leader = match runtime::running_leader() {
         Ok(Some(l)) => l,
-        _ => return,
+        _ => {
+            warn!("session setup skipped: container leader not found");
+            return;
+        }
     };
     let user = cuser(config);
     let script = provision::runtime_setup_script(&user, headless);
-    let _ = runtime::exec_pid_env(leader, &["/bin/sh", "-c", &script], None, &[]);
+    // Surface failures loudly. This routine sets up the keyring and starts the
+    // compliance agent timer; when it silently failed (e.g. a setns EPERM), the
+    // device drifted to non-compliant with no visible signal for days.
+    match runtime::exec_pid_env(leader, &["/bin/sh", "-c", &script], None, &[]) {
+        Ok(0) => {}
+        Ok(code) => warn!(code, "session setup script exited non-zero"),
+        Err(e) => error!("session setup failed to run in the container: {e:#}"),
+    }
+    // The compliance agent must end up running, or the device never reports
+    // compliant. A masked/inactive timer is the exact silent failure we hit.
+    if !agent_timer_active(config) {
+        warn!(
+            "Intune compliance agent timer is not active after session setup; the \
+             device will not report compliant. Check: intune-container doctor"
+        );
+    }
+}
+
+/// Whether the Intune compliance agent timer is active (not masked or stopped)
+/// in the running container's user session. Runs as the container root (uid 0),
+/// whose user manager owns the timer.
+fn agent_timer_active(config: &Config) -> bool {
+    let script = "export XDG_RUNTIME_DIR=/run/user/0 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus; systemctl --user is-active --quiet intune-agent.timer";
+    probe(config, script) == 0
 }
 
 /// Re-exec this binary as a detached `__rootless-supervise` process that boots

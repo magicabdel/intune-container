@@ -1221,6 +1221,48 @@ mod tests {
         assert!(active, "broker did not become active via setns exec");
     }
 
+    /// Boot systemd in the **hardened** profile (private IPC namespace) and
+    /// confirm we can still `setns` into it. Regression test for the IPC-join
+    /// EPERM bug: joining the IPC namespace unconditionally broke entering a
+    /// compat container, and a private IPC ns must be enterable here.
+    ///   cargo test --lib exec_in_hardened_container -- --ignored --nocapture
+    #[test]
+    #[ignore = "boots systemd and execs into it; run via `just smoke`"]
+    fn exec_in_hardened_container() {
+        let rootfs = ensure_rootfs();
+        let _ = fs::remove_file(
+            rootfs.join("etc/systemd/system/multi-user.target.wants/intune-probe.service"),
+        );
+        let log = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("exec-hardened-boot.log");
+        let _ = fs::remove_file(&log);
+
+        // hardened = true → unshares a private IPC namespace.
+        let c = start_systemd(&rootfs, &[], Some(&log), true).unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(2));
+
+        // The exact operation the bug broke: `setns` into the container. A failed
+        // IPC join surfaced as exec code 127, so this asserts the join works.
+        let code = c
+            .exec(&["/usr/bin/sh", "-c", "echo HARDENED-EXEC-OK"], None)
+            .unwrap_or(127);
+
+        // The IPC namespace must be genuinely private (different from the host's).
+        let host_ipc = fs::read_link("/proc/self/ns/ipc").ok();
+        let cont_ipc = fs::read_link(format!("/proc/{}/ns/ipc", c.leader_pid())).ok();
+
+        let _ = c.stop();
+        assert_eq!(
+            code, 0,
+            "exec into hardened container failed (setns regression)"
+        );
+        assert!(
+            host_ipc.is_some() && host_ipc != cont_ipc,
+            "hardened container must have a private IPC namespace (host={host_ipc:?} container={cont_ipc:?})"
+        );
+    }
+
     /// Boot the container with the host's real display attach plan, then exec a
     /// probe to confirm the forwarded socket is visible inside and the display
     /// environment is set on the launched process.

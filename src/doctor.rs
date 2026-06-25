@@ -86,17 +86,21 @@ pub fn collect() -> Vec<Check> {
 
     // --- Persistent state (survives rebuilds), host-readable ---
     let persist = persist_dir();
-    let device_dir = persist.join("state/device-broker");
-    match dir_has_content(&device_dir) {
-        true => checks.push(Check::new(
-            Status::Ok,
-            "Device registration",
-            "present (persisted on host)",
-        )),
-        false => checks.push(Check::new(
+    // Registration consistency (drift detection). The device key itself lives in
+    // the keyring (checked below); here we flag a registration the agent marked
+    // as needing repair — the "stuck re-enrolling → non-compliant" state we hit.
+    let reg = persist.join("home/config-intune/registration.toml");
+    match std::fs::read_to_string(&reg) {
+        Ok(s) if s.contains("needs_patching = \"true\"") => checks.push(Check::new(
             Status::Warn,
-            "Device registration",
-            "empty — enroll with: intune-container enroll",
+            "Registration",
+            "needs patching (device-identity drift) — re-enroll if non-compliant",
+        )),
+        Ok(_) => checks.push(Check::new(Status::Ok, "Registration", "consistent")),
+        Err(_) => checks.push(Check::new(
+            Status::Skip,
+            "Registration",
+            "not enrolled yet — run: intune-container enroll",
         )),
     }
 
@@ -227,6 +231,54 @@ pub fn collect() -> Vec<Check> {
         )),
     }
 
+    // Compliance agent (the silent-failure guard). The timer must be active and
+    // not masked, and the last check-in must not have failed — exactly what broke
+    // before, leaving the device to drift to non-compliant with no visible sign.
+    let env =
+        "export XDG_RUNTIME_DIR=/run/user/0 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus;";
+    let masked = backend::probe(
+        &config,
+        &format!(
+            "{env} [ \"$(systemctl --user is-enabled intune-agent.timer 2>/dev/null)\" = masked ]"
+        ),
+    ) == 0;
+    let active = backend::probe(
+        &config,
+        &format!("{env} systemctl --user is-active --quiet intune-agent.timer"),
+    ) == 0;
+    if masked {
+        checks.push(Check::new(
+            Status::Fail,
+            "Compliance agent",
+            "timer masked — device won't report compliant; re-enroll",
+        ));
+    } else if active {
+        checks.push(Check::new(Status::Ok, "Compliance agent", "timer active"));
+    } else {
+        checks.push(Check::new(
+            Status::Warn,
+            "Compliance agent",
+            "timer not active — run: intune-container daemon",
+        ));
+    }
+    let checkin_failed = backend::probe(
+        &config,
+        &format!("{env} systemctl --user is-failed --quiet intune-agent.service"),
+    ) == 0;
+    if checkin_failed {
+        checks.push(Check::new(
+            Status::Fail,
+            "Last check-in",
+            "intune-agent failed — see: journalctl --user -u intune-agent.service",
+        ));
+    } else {
+        checks.push(Check::new(
+            Status::Ok,
+            "Last check-in",
+            "no failure recorded",
+        ));
+    }
+
     checks
 }
 
@@ -265,11 +317,4 @@ fn persist_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("."))
         .join("intune-container")
         .join("persist")
-}
-
-/// Whether a directory exists and has any content.
-fn dir_has_content(dir: &Path) -> bool {
-    std::fs::read_dir(dir)
-        .map(|mut it| it.next().is_some())
-        .unwrap_or(false)
 }

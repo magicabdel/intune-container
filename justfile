@@ -37,6 +37,14 @@ build-image:
 test:
     cargo test --lib
 
+# Boot smoke test — RUN BEFORE MERGING ANY runtime/namespace/cgroup change.
+# Boots a real container in BOTH profiles and `setns`-execs into each. Unit tests
+# can't catch this class of bug (they never boot); the compat/hardened IPC-join
+# EPERM regression that silently broke compliance would have been caught here.
+# Needs the cached rootfs (auto-extracted on first run) + a user systemd manager.
+smoke:
+    cargo test --lib -- --ignored --nocapture exec_in_running_container exec_in_hardened_container
+
 # Run clippy lints
 lint:
     cargo clippy -- -W clippy::all
