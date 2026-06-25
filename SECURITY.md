@@ -1,79 +1,88 @@
-# Security Policy
+# Security model
+
+This document states, precisely and honestly, what isolation `intune-container`
+provides — and what it does not. The runtime is rootless (no host root, no
+`sudo`): the container is built from an unprivileged user namespace, and the
+container's `root` (uid 0) maps to your own host user. Files created inside stay
+owned by you.
+
+Read this before relying on the container as a security boundary.
+
+## What we are protecting, and from whom
+
+**Adversary (the threat we defend against):** a *compromised or backdoored
+identity broker*, or a *hostile payload arriving through the browser SSO bridge*.
+That is, a process that ends up running inside the container and turns hostile.
+
+**Protected assets:** host root, your host user session, your `$HOME`, the host
+display (keystrokes/screen), and
+ host-local sockets and services.
+
+**The claim (daemon mode only):** a hostile in-container process cannot reach
+host root, read your home, observe your display, reach host-local sockets, or
+exhaust your session's memory/process budget.
+
+## Two profiles
+
+The boundary depends on which profile the container booted under. The profile is
+chosen automatically from whether the host display is attached.
+
+| Profile | When | Boundary |
+|---|---|---|
+| **hardened** | daemon / headless (`with_display == false`) | real boundary against the adversary above |
+| **compat** | interactive GUI (display attached) | **not** a boundary — see below |
+
+The `compat` profile forwards the host Wayland/X11 socket into the container so
+the Intune portal and SSO popup render on your desktop. X11 in particular has no
+intra-display isolation: any client can keylog and screenshot the whole session.
+While the display is attached, the container is a convenience sandbox, not a
+security boundary. Detaching the display (returning to headless) restarts under
+the hardened profile.
+
+## Out of scope
+
+- **Kernel exploits.** The hardened profile shrinks the kernel attack surface
+  (seccomp, dropped capabilities, `no_new_privs`, no nested user namespaces) but
+  cannot eliminate it: unprivileged user namespaces are themselves part of that
+  surface. An attacker with a kernel local-privilege-escalation exploit is *not*
+  contained by a rootless runtime. Containing that adversary requires a virtual
+  machine (Firecracker / Cloud Hypervisor) or a userspace kernel (gVisor), which
+  is a different architecture.
+- **Supply chain.** A genuine boundary contains a compromised broker; it does
+  not vouch for the broker image's integrity. Trust the image you run.
+
+## Acknowledged trust boundary: the SSO bridge
+
+`intune-container` exists to feed the host browser extension tokens via a
+native-messaging bridge to the in-container identity broker. That channel is an
+*authorized hole* in the boundary and cannot be removed — it is the reason the
+container exists. The bridge runs inside the container (joining the broker's own
+session bus via `setns`), forwards only the specific broker operations the
+extension needs, and exposes no host bus. It is part of the attack surface and is
+reviewed as such.
+
+## Hardening status
+
+The hardened daemon profile is being built in phases. Implemented so far:
+
+- **Resource limits** — the container's delegated cgroup scope caps process count
+  (and, in the hardened profile, memory), so a fork bomb or runaway broker cannot
+  exhaust the host user session.
+- **Private IPC namespace** (hardened only) — the container does not share the
+  host's System V / POSIX shared memory or `/dev/shm`. (The compat profile keeps
+  the host IPC namespace, which XWayland's MIT-SHM requires.)
+
+Planned: seccomp allow-list, capability bounding-set drop, `no_new_privs`,
+curated `/dev` and read-only `/sys`, private network namespace with userspace
+egress, and an AppArmor/SELinux profile. Until those land, the hardened profile is
+stronger than compat but does not yet meet the full claim above.
 
 ## Reporting a vulnerability
 
 Please report security issues **privately** rather than opening a public issue.
-Use GitHub's "Report a vulnerability" (Security → Advisories) on this
-repository, or email the maintainers listed in `Cargo.toml` / the repository
-profile. We aim to acknowledge reports within a few days.
-
-When reporting, include the affected version, your distro/compositor, and steps
-to reproduce.
-
-## Trust & threat model
-
-`intune-container` runs Microsoft Intune inside a `systemd-nspawn` container and
-brokers Entra ID authentication to your host browser. Understanding what it does
-and does **not** isolate is important before deploying it.
-
-### Host privileges it installs
-
-- **Passwordless sudo for one helper.** `init` installs
-  `/etc/sudoers.d/intune-container` granting the invoking user `NOPASSWD` on a
-  single root-owned helper, `/usr/local/libexec/intune-container/nsenter-exec`.
-  The helper resolves the container's leader PID **itself** (from the fixed
-  machine name) and `nsenter`s into the container, then drops to the
-  unprivileged container user via `su` before running the caller-supplied
-  script. The net capability granted is therefore equivalent to *"run commands
-  as the container user inside the container"* — comparable to `machinectl
-  shell` — not host root. The caller cannot choose an arbitrary PID/namespace.
-- **`destroy` removes this rule and helper** so teardown leaves no dangling
-  passwordless-sudo grant. `just uninstall` only removes the binary; run
-  `intune-container destroy` for full host cleanup.
-- Other privileged actions (`systemd-nspawn`, `machinectl poweroff`, extracting
-  the rootfs into `/var/lib/machines`) run via `sudo` and will prompt normally.
-
-### What is isolated
-
-- **Display (default headless).** By default the container has **no** access to
-  your real display or GPU. The Microsoft identity broker runs against a
-  private in-container `Xvfb`. The host screen is only bound in for the
-  interactive `enroll` and `edge` flows, for the duration of that session.
-- **Filesystem.** The container uses its own rootfs; only `~/Intune`, the
-  device-state dirs, and (for SSO) a session-bus socket directory are bind
-  mounted.
-
-### What is NOT isolated (important)
-
-- **Network namespace is shared with the host.** The container is **not** run
-  with `--private-network`; it uses the host's network stack and a copy of the
-  host resolver. Consequences:
-  - The container can reach host-local services on `localhost` and **host
-    abstract UNIX sockets** — including a Wayland compositor's *abstract* X11
-    socket (e.g. niri's XWayland) — regardless of whether any display directory
-    is bind-mounted. "Headless" removes the *filesystem* display binding, not
-    network reachability of host-local sockets.
-  - Treat the container as having the same network reach as your user.
-  Private-network isolation (veth/NAT) is planned but not yet implemented.
-- **Auth tokens** live in the container's gnome-keyring (unlocked with an empty
-  passphrase, mirroring a desktop login keyring) and are reachable by anything
-  that can talk to the container's session bus while SSO (`daemon`) is enabled.
-- **IPC namespace for display apps.** The interactive GUI flows (`enroll` portal,
-  `edge`) are launched in the **host IPC namespace** (the nsenter helper omits
-  `-i`) so X shared memory (MIT-SHM) works against the host's XWayland server;
-  otherwise the apps crash with an X11 `BadAccess`. While running, those apps can
-  therefore see host SysV IPC (shared memory / semaphores) as your user. The
-  default headless background path keeps the container's private IPC namespace.
-
-### Browser SSO
-
-`daemon` installs a native-messaging host (this binary) for the
-[`linux-entra-sso`](https://github.com/siemens/linux-entra-sso) browser
-extension. Install that extension only from its official signed releases. The
-native host connects to the container's broker over the exposed session-bus
-socket and returns PRT SSO cookies/tokens to the extension for
-`login.microsoftonline.com` flows.
-
-## Supported versions
+Use GitHub's "Report a vulnerability" (Security → Advisories) on this repository,
+or email the maintainer listed in `Cargo.toml`. We aim to acknowledge reports
+within a few days. Include the affected version, your distro/compositor, and
+steps to reproduce.
 
 This project is pre-1.0; only the latest release receives security fixes.

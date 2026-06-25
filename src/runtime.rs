@@ -1,12 +1,19 @@
-//! Pure-Rust rootless container runtime (experimental, Phase 3 spike).
+//! Pure-Rust rootless container runtime.
 //!
-//! Creates an unprivileged user namespace (no sudo), plus mount/pid/uts/ipc
-//! namespaces, sets up `/proc`, `/dev`, `/sys` and `/run`, `chroot`s into a
-//! rootfs, and execs a command as PID 1. The host network namespace is kept, so
+//! Creates an unprivileged user namespace (no sudo), plus mount/pid/uts
+//! namespaces, sets up `/proc`, `/dev`, `/sys` and `/run`, `pivot_root`s into a
+//! rootfs, and boots the rootfs's systemd as PID 1 (cgroup-v2 delegation via a
+//! transient scope on the user manager). The host network namespace is kept, so
 //! no slirp is needed.
 //!
-//! This proves *our own* runtime can enter a container; booting the rootfs's
-//! systemd (cgroup-v2 delegation, `pivot_root`) is the next milestone.
+//! ## Security profiles
+//!
+//! Callers pass `hardened` to select a profile (see `SECURITY.md`):
+//!
+//! - **hardened** (daemon / headless): also unshares the IPC namespace and the
+//!   delegated scope caps memory as well as tasks.
+//! - **compat** (interactive GUI): keeps the host IPC namespace so XWayland's
+//!   MIT-SHM works for forwarded GUI apps; the scope caps tasks only.
 //!
 //! IMPORTANT: `unshare(CLONE_NEWUSER)` requires a single-threaded process, so we
 //! `fork()` first and do all namespace work in the (single-threaded) child. A
@@ -178,6 +185,7 @@ pub fn start_systemd(
     rootfs: &Path,
     binds: &[(PathBuf, PathBuf)],
     log: Option<&Path>,
+    hardened: bool,
 ) -> Result<Container> {
     let uid = getuid().as_raw();
     let gid = getgid().as_raw();
@@ -210,7 +218,7 @@ pub fn start_systemd(
             close_fd(ready_r);
             let scope = format!("intune-{}.scope", child.as_raw());
             let setup = set_id_maps(child, uid, gid).and_then(|_| {
-                create_delegated_scope(child.as_raw(), &scope)?;
+                create_delegated_scope(child.as_raw(), &scope, hardened)?;
                 wait_in_scope(child.as_raw(), &scope);
                 Ok(())
             });
@@ -236,19 +244,23 @@ pub fn start_systemd(
             close_fd(go_w);
             close_fd(gpid_r);
             let _ = setsid();
-            // Note: we deliberately do NOT unshare CLONE_NEWIPC. Sharing the host
-            // IPC namespace lets XWayland's MIT-SHM ShmAttach succeed for GUI apps
-            // (a private IPC ns makes the host X server unable to attach the
-            // container's shared-memory segment → fatal BadAccess in GTK). This
-            // matches what distrobox/toolbox do for containerized GUI apps.
-            if unshare(
-                CloneFlags::CLONE_NEWUSER
-                    | CloneFlags::CLONE_NEWNS
-                    | CloneFlags::CLONE_NEWPID
-                    | CloneFlags::CLONE_NEWUTS,
-            )
-            .is_err()
-            {
+            // We deliberately keep the host network namespace (the broker needs
+            // egress and the GUI path reaches the host display sockets).
+            //
+            // IPC is profile-dependent: the `hardened` (headless) profile
+            // unshares it for a private SysV/POSIX shm + /dev/shm. The `compat`
+            // profile keeps the host IPC namespace so XWayland's MIT-SHM
+            // ShmAttach succeeds for forwarded GUI apps (a private IPC ns makes
+            // the host X server unable to attach the container's shared-memory
+            // segment → fatal BadAccess in GTK). This matches distrobox/toolbox.
+            let mut flags = CloneFlags::CLONE_NEWUSER
+                | CloneFlags::CLONE_NEWNS
+                | CloneFlags::CLONE_NEWPID
+                | CloneFlags::CLONE_NEWUTS;
+            if hardened {
+                flags |= CloneFlags::CLONE_NEWIPC;
+            }
+            if unshare(flags).is_err() {
                 unsafe { nix::libc::_exit(126) }
             }
             let b = [1u8; 1];
@@ -293,8 +305,9 @@ pub fn boot_systemd(
     rootfs: &Path,
     binds: &[(PathBuf, PathBuf)],
     log: Option<&Path>,
+    hardened: bool,
 ) -> Result<i32> {
-    start_systemd(rootfs, binds, log)?.wait()
+    start_systemd(rootfs, binds, log, hardened)?.wait()
 }
 
 impl Container {
@@ -430,6 +443,38 @@ where
     }
 }
 
+/// Namespaces to `setns` into when entering a running container, in join order
+/// (user first, so we hold caps in the container's user ns for the rest).
+///
+/// IPC is included only when the leader is in a *different* IPC namespace than us
+/// (the hardened profile's private ns, owned by the container user ns, which we
+/// can join). In the compat profile the container shares the host IPC namespace,
+/// owned by the host's *initial* user ns: re-entering it as an unprivileged user
+/// fails with `EPERM` (we lack `CAP_SYS_ADMIN` there), and it would be a no-op
+/// anyway since we're already in it.
+fn ns_join_order(leader: i32) -> Vec<(&'static str, CloneFlags)> {
+    let mut order = vec![
+        ("user", CloneFlags::CLONE_NEWUSER),
+        ("uts", CloneFlags::CLONE_NEWUTS),
+    ];
+    if !shares_namespace(leader, "ipc") {
+        order.push(("ipc", CloneFlags::CLONE_NEWIPC));
+    }
+    order.push(("pid", CloneFlags::CLONE_NEWPID));
+    order.push(("cgroup", CloneFlags::CLONE_NEWCGROUP));
+    order.push(("mnt", CloneFlags::CLONE_NEWNS));
+    order
+}
+
+/// Whether `leader` is in the same `ns` namespace as the calling process. Reads
+/// the magic symlink targets (`ipc:[<inode>]`), which are equal iff the two
+/// processes share that namespace.
+fn shares_namespace(leader: i32, ns: &str) -> bool {
+    let ours = std::fs::read_link(format!("/proc/self/ns/{ns}")).ok();
+    let theirs = std::fs::read_link(format!("/proc/{leader}/ns/{ns}")).ok();
+    ours.is_some() && ours == theirs
+}
+
 /// Join the leader's namespaces, fork into the pid namespace, and run `f` there.
 fn enter_and_run<F>(leader: i32, as_uid: Option<u32>, env: &[(String, String)], f: F) -> Result<i32>
 where
@@ -437,13 +482,7 @@ where
 {
     use nix::sched::setns;
 
-    let order = [
-        ("user", CloneFlags::CLONE_NEWUSER),
-        ("uts", CloneFlags::CLONE_NEWUTS),
-        ("pid", CloneFlags::CLONE_NEWPID),
-        ("cgroup", CloneFlags::CLONE_NEWCGROUP),
-        ("mnt", CloneFlags::CLONE_NEWNS),
-    ];
+    let order = ns_join_order(leader);
     let mut fds = Vec::new();
     for (ns, flag) in order {
         let path = format!("/proc/{leader}/ns/{ns}");
@@ -504,15 +543,7 @@ fn enter_and_exec(
     use nix::sched::setns;
 
     // Open all ns fds first — after we join the mount ns, /proc/<leader> changes.
-    // Note: no IPC namespace — the container shares the host's (see start_systemd)
-    // so GUI apps' MIT-SHM works; there's nothing to join.
-    let order = [
-        ("user", CloneFlags::CLONE_NEWUSER),
-        ("uts", CloneFlags::CLONE_NEWUTS),
-        ("pid", CloneFlags::CLONE_NEWPID),
-        ("cgroup", CloneFlags::CLONE_NEWCGROUP),
-        ("mnt", CloneFlags::CLONE_NEWNS),
-    ];
+    let order = ns_join_order(leader);
     let mut fds = Vec::new();
     for (ns, flag) in order {
         let path = format!("/proc/{leader}/ns/{ns}");
@@ -841,7 +872,20 @@ fn spawn_watchdog(group_leader: Pid, after: Duration) {
 /// Ask the user's systemd manager (over the session bus) to place `pid` into a
 /// transient scope (`scope`) with cgroup **delegation**, so a `cgroup2` mounted
 /// inside is writable and systemd can manage its own subtree.
-fn create_delegated_scope(pid: i32, scope: &str) -> Result<()> {
+///
+/// Both profiles cap the task count (fork-bomb / runaway containment) at a level
+/// generous enough for the GUI path (a browser spawns many helpers). The
+/// `hardened` profile additionally caps memory: the headless daemon (broker +
+/// compliance agent) is light, so a hard ceiling contains a runaway without
+/// risking the OOM-kill of a legitimate forwarded browser.
+fn create_delegated_scope(pid: i32, scope: &str, hardened: bool) -> Result<()> {
+    // Process-count ceiling, both profiles. High enough for a browser's helpers.
+    const TASKS_MAX: u64 = 8192;
+    // Memory ceilings, hardened profile only. `High` throttles via reclaim before
+    // `Max` hard-fails an allocation. .NET-based broker headroom included.
+    const MEMORY_HIGH: u64 = 3 * 1024 * 1024 * 1024;
+    const MEMORY_MAX: u64 = 4 * 1024 * 1024 * 1024;
+
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -860,14 +904,19 @@ fn create_delegated_scope(pid: i32, scope: &str) -> Result<()> {
         .context("open systemd manager proxy")?;
 
         // StartTransientUnit(name, mode, properties: a(sv), aux: a(sa(sv))) -> o
-        let props: Vec<(&str, zbus::zvariant::Value)> = vec![
+        let mut props: Vec<(&str, zbus::zvariant::Value)> = vec![
             (
                 "Description",
                 zbus::zvariant::Value::from("intune-container rootless"),
             ),
             ("PIDs", zbus::zvariant::Value::from(vec![pid as u32])),
             ("Delegate", zbus::zvariant::Value::from(true)),
+            ("TasksMax", zbus::zvariant::Value::from(TASKS_MAX)),
         ];
+        if hardened {
+            props.push(("MemoryHigh", zbus::zvariant::Value::from(MEMORY_HIGH)));
+            props.push(("MemoryMax", zbus::zvariant::Value::from(MEMORY_MAX)));
+        }
         let aux: Vec<(&str, Vec<(&str, zbus::zvariant::Value)>)> = Vec::new();
         let _job: zbus::zvariant::OwnedObjectPath = proxy
             .call("StartTransientUnit", &(scope, "replace", props, aux))
@@ -1106,7 +1155,7 @@ mod tests {
         let _ = fs::remove_file(&log);
 
         let binds = vec![(probe.clone(), PathBuf::from("/run/intune-probe"))];
-        let code = boot_systemd(&rootfs, &binds, Some(&log)).unwrap();
+        let code = boot_systemd(&rootfs, &binds, Some(&log), false).unwrap();
 
         let system = fs::read_to_string(probe.join("system")).unwrap_or_default();
         let broker = fs::read_to_string(probe.join("broker")).unwrap_or_default();
@@ -1137,7 +1186,7 @@ mod tests {
             .join("exec-boot.log");
         let _ = fs::remove_file(&log);
 
-        let c = start_systemd(&rootfs, &[], Some(&log)).unwrap();
+        let c = start_systemd(&rootfs, &[], Some(&log), false).unwrap();
 
         let mut active = false;
         for _ in 0..40 {
@@ -1196,7 +1245,7 @@ mod tests {
             .join("display-attach.log");
         let _ = fs::remove_file(&log);
 
-        let c = start_systemd(&rootfs, &plan.binds, Some(&log)).unwrap();
+        let c = start_systemd(&rootfs, &plan.binds, Some(&log), false).unwrap();
         std::thread::sleep(std::time::Duration::from_secs(3));
 
         if let Some(path) = &probe_path {

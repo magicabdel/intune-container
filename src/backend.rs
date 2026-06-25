@@ -274,7 +274,11 @@ pub fn supervise_main(with_display: bool) -> Result<i32> {
     }
 
     let log = boot_log();
-    let container = runtime::start_systemd(&rootfs, &binds, Some(&log)).context("start_systemd")?;
+    // Headless (no display forwarded) selects the hardened security profile;
+    // an attached display selects the compat profile (see SECURITY.md).
+    let hardened = !with_display;
+    let container =
+        runtime::start_systemd(&rootfs, &binds, Some(&log), hardened).context("start_systemd")?;
     runtime::save_runtime_state(&container.state())?;
     info!(leader = container.leader_pid(), "container booted");
 
