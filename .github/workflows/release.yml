@@ -6,9 +6,13 @@
 #                (ghcr.io/<owner>/<repo>).
 # 3. `bundle`  — builds the desktop app (GUI) with Tauri and uploads the Linux
 #                bundles (.deb, .rpm, AppImage) to the GitHub Release.
-# `image` and `bundle` run in parallel after `verify`.
+# 4. `cargo`   — publishes the CLI crate (the default, GUI-less build) to
+#                crates.io. Idempotent: skips if the version is already up.
+# `image`, `bundle` and `cargo` run in parallel after `verify`.
 #
 # ── Required configuration ───────────────────────────────────────────────────
+# Secrets:
+#   CARGO_REGISTRY_TOKEN  crates.io API token (for the `cargo` job)
 # ghcr.io and the GitHub Release both use the built-in GITHUB_TOKEN (see the
 # `packages: write` / `contents: write` permissions on the jobs) — no extra
 # secrets needed. Ensure the ghcr package's visibility is set as desired in the
@@ -109,15 +113,67 @@ jobs:
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
+      # Use our patched linuxdeploy GTK plugin so the AppImage doesn't bundle
+      # host-managed graphics/Wayland libs (libepoxy, libwayland-*), which break
+      # EGL on modern/hybrid GPUs. Tauri uses the cached copy if it's present.
+      - name: Install patched linuxdeploy GTK plugin
+        run: |
+          mkdir -p "$HOME/.cache/tauri"
+          cp scripts/linuxdeploy-plugin-gtk.sh "$HOME/.cache/tauri/linuxdeploy-plugin-gtk.sh"
+          chmod +x "$HOME/.cache/tauri/linuxdeploy-plugin-gtk.sh"
+
       # Builds the bundles (bundle.targets "all" → deb, rpm, AppImage) and
       # attaches them to the Release for the tag that triggered this run.
+      # `--features gui` is required: the crate is CLI-only by default, so the
+      # GUI (Tauri) is only compiled in when that feature is enabled.
       - name: Build & upload bundles
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
+          args: --features gui
           tagName: ${{ github.ref_name }}
           releaseName: ${{ github.ref_name }}
           releaseBody: "See CHANGELOG.md for the release notes."
           releaseDraft: false
           prerelease: false
+
+  cargo:
+    name: Publish CLI crate (crates.io)
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The default build is CLI-only (no `gui` feature), so this needs no
+      # GTK/WebKitGTK or compiled frontend.
+      # Fail fast if the tag and Cargo.toml version disagree, so we never publish
+      # a crate whose version doesn't match the tag that triggered the release.
+      - name: Check tag matches Cargo.toml version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          crate="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          echo "tag=$tag  crate=$crate"
+          test "$tag" = "$crate" || { echo "::error::tag v$tag != Cargo.toml $crate"; exit 1; }
+
+      # crates.io has no --skip-existing, and published versions are immutable, so
+      # re-tagging would otherwise fail here. Skip the publish when the version is
+      # already up (the version endpoint returns 200 if it exists, 404 if not; a
+      # User-Agent is required or crates.io 403s).
+      - name: Publish (skip if the version already exists)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          name="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].name')"
+          ver="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          code="$(curl -s -o /dev/null -w '%{http_code}' \
+            -A "$name-release-ci" "https://crates.io/api/v1/crates/$name/$ver")"
+          if [ "$code" = "200" ]; then
+            echo "::notice::$name $ver is already on crates.io — skipping publish."
+          else
+            cargo publish --locked
+          fi

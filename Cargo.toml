@@ -1,6 +1,6 @@
 [package]
 name = "intune-container"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Manage Microsoft Intune in an isolated, rootless Linux container (GUI + CLI in one binary)"
 license = "MIT"
@@ -14,7 +14,7 @@ repository = "https://github.com/magicabdel/intune-container"
 # default). The desktop interface is built from the git repo with
 # `--features gui`, so its assets — useless without the compile-time frontend
 # build — are kept out of the package.
-exclude = ["/frontend", "/docs", "/site"]
+exclude = ["/frontend", "/docs", "/site", "/scripts"]
 
 # One package, two targets: a library with all the logic, and a single binary
 # that is the command-line tool and — when built with the `gui` feature — the

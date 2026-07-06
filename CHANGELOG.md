@@ -6,6 +6,29 @@ to follow [Semantic Versioning](https://semver.org/) once it reaches 1.0.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-07-06
+
+### Fixed
+
+- **AppImage: blank window / `EGL_BAD_PARAMETER` on modern and hybrid GPUs**
+  (e.g. Intel + NVIDIA laptops). The bundler was shipping host-managed graphics
+  and Wayland libraries (`libepoxy`, `libwayland-*`) inside the AppImage, which
+  shadowed the user's own copies and broke EGL initialization. A patched
+  `linuxdeploy` GTK plugin now drops those libraries so the app uses the host's
+  GPU stack, as a well-formed AppImage should. (see tauri-apps/tauri#9394)
+- **GUI single instance.** Launching `intune-container` repeatedly no longer
+  stacks up duplicate, tray-resident interface processes. A file lock guarantees
+  a single interface; the D-Bus single-instance dedup was unreliable on some
+  Wayland compositors.
+- **Tray icon lingering after Quit.** The tray icon is now explicitly withdrawn
+  on Quit instead of occasionally staying in the panel after the app exits.
+
+### Added
+
+- **`just bundle-appimage`** — build the desktop AppImage in an Ubuntu container,
+  the same way CI does. Reproducible, needs no FUSE on the host, and sidesteps
+  bleeding-edge host toolchains that trip up the AppImage tooling.
+
 ## [0.2.0] - 2026-06-25
 
 ### Changed
