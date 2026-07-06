@@ -538,7 +538,14 @@ fn build_tray_inner(app: &AppHandle) -> tauri::Result<()> {
             "portal" => fire("portal"),
             "edge" => fire("edge"),
             "power" => fire_power(),
-            "quit" => app.exit(0),
+            "quit" => {
+                // Withdraw the tray icon before exiting. `app.exit` drops it too,
+                // but some StatusNotifier hosts (e.g. panels on wlroots
+                // compositors) don't remove a stale item promptly on process
+                // exit, leaving a ghost icon; removing it explicitly avoids that.
+                let _ = app.remove_tray_by_id("main");
+                app.exit(0);
+            }
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
@@ -594,6 +601,27 @@ fn build_tray(app: &AppHandle) -> bool {
 
 /// Run the Tauri interface. Blocks until the app exits.
 pub fn run() {
+    // Hard single-instance guard. `tauri-plugin-single-instance` (below) is meant
+    // to focus the existing window on relaunch, but its D-Bus dedup is unreliable
+    // under some Wayland compositors, which lets tray-resident duplicates stack
+    // up (a new detached process per launch, each holding its own tray icon). A
+    // file lock held for this process's whole life is the reliable backstop: a
+    // duplicate launch finds it held and exits here instead of starting a second
+    // interface. The lock frees automatically if this process dies (flock on an
+    // open fd), so a crash never leaves it stuck.
+    let _gui_instance: Option<intune_container::lock::SingletonLock> =
+        match intune_container::lock::SingletonLock::try_acquire("gui") {
+            Ok(Some(lock)) => Some(lock),
+            Ok(None) => {
+                tracing::info!("interface already running; not starting a second instance");
+                return;
+            }
+            Err(e) => {
+                tracing::warn!("single-instance lock unavailable ({e:#}); relying on the plugin");
+                None
+            }
+        };
+
     tauri::Builder::default()
         // Must be registered FIRST. A second `intune-container` launch focuses the
         // existing window (showing it from the tray) instead of starting a

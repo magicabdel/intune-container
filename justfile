@@ -8,7 +8,7 @@ default:
 # Build the binary (GUI + CLI) in release mode. Builds the TypeScript/Emotion
 # frontend first, since Tauri embeds it into the binary at compile time.
 build: frontend
-    cargo build --release
+    cargo build --release --features=gui
 
 # Build the TypeScript + Emotion frontend (requires Node.js + npm)
 frontend:
@@ -32,6 +32,44 @@ build-image:
     echo "✓ Built localhost/intune-container:local (via $engine $iso)"
     echo "  Test:  intune-container init --force --image localhost/intune-container:local"
     echo "  Push:  $engine tag localhost/intune-container:local <registry>/intune-container:latest && $engine push <registry>/intune-container:latest"
+
+# Build the desktop AppImage in an Ubuntu 22.04 container (matches CI; avoids
+# bleeding-edge toolchain issues). Uses the patched linuxdeploy GTK plugin so the
+# AppImage doesn't bundle host-managed libepoxy/libwayland (which break EGL on
+# modern/hybrid GPUs). Needs no FUSE on the host. Output (as you, not root):
+# target-docker/release/bundle/appimage/*.AppImage
+bundle-appimage:
+    #!/usr/bin/env sh
+    set -eu
+    engine=$(command -v docker >/dev/null 2>&1 && echo docker || echo podman)
+    uid=$(id -u); gid=$(id -g)
+    echo "Building the AppImage in ubuntu:22.04 via $engine (first run installs toolchains)..."
+    "$engine" run --rm -t \
+        -v "$PWD":/work -w /work \
+        -e CARGO_TARGET_DIR=/work/target-docker \
+        -e APPIMAGE_EXTRACT_AND_RUN=1 \
+        -e NO_STRIP=true \
+        -e DEBIAN_FRONTEND=noninteractive \
+        -e HOST_UID="$uid" -e HOST_GID="$gid" \
+        ubuntu:22.04 sh -euc '
+            rm -rf "$CARGO_TARGET_DIR"
+            apt-get update
+            apt-get install -y --no-install-recommends \
+                curl ca-certificates git build-essential pkg-config file patchelf desktop-file-utils \
+                libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev
+            curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+            apt-get install -y nodejs
+            curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
+            . "$HOME/.cargo/env"
+            npm install -g @tauri-apps/cli@^2
+            mkdir -p "$HOME/.cache/tauri"
+            cp /work/scripts/linuxdeploy-plugin-gtk.sh "$HOME/.cache/tauri/linuxdeploy-plugin-gtk.sh"
+            chmod +x "$HOME/.cache/tauri/linuxdeploy-plugin-gtk.sh"
+            tauri build --features gui --bundles appimage
+            chown -R "$HOST_UID:$HOST_GID" target-docker frontend/dist frontend/node_modules gen 2>/dev/null || true
+        '
+    echo "✓ AppImage at target-docker/release/bundle/appimage/"
+    echo "  Run it:  ./target-docker/release/bundle/appimage/*.AppImage"
 
 # Run tests (library unit tests; no frontend build required)
 test:
