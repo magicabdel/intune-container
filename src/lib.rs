@@ -12,6 +12,7 @@
 //! out to the other. The container runs rootless via [`backend`] (user
 //! namespaces, no host root): see [`runtime`], [`oci`], and [`provision`].
 
+pub mod autostart;
 pub mod backend;
 pub mod backup;
 pub mod compositor;
