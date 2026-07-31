@@ -127,19 +127,65 @@ fn seed_keyring_dir(rootfs: &Path, user: &ContainerUser) -> Result<()> {
     Ok(())
 }
 
+/// The `/dev/shm` names the identity broker's POSIX semaphores take: one per
+/// OneAuth store (`sem.OneAuth_FS_…`), plus the MSAL cross-process locks, named
+/// `sem.<app-uuid>:<hash>`.
+const BROKER_SEM_GLOBS: &str = "/dev/shm/sem.OneAuth_* /dev/shm/sem.*-*-*-*-*:*";
+
+/// A shell `for` loop over every **stale** broker lock, running `action` for each
+/// (`$_sem` holds the path). Stale means two things at once: the semaphore counter
+/// is 0 (somebody holds it) and no live process maps the file (nobody does).
+///
+/// This exists because `/dev/shm` is shared with the host, so those semaphores
+/// outlive the container. A broker killed while it held one — which stopping the
+/// container mid-token-call does — leaves the counter at 0 for ever. Every later
+/// `getAccounts` call then blocks for 15 seconds and answers with an empty account
+/// list, so the device looks signed out while enrollment, bus and keyring all read
+/// healthy. No container restart clears it; deleting the file does, and the next
+/// lock recreates it.
+pub fn stale_broker_locks_script(action: &str) -> String {
+    format!(
+        r#"for _sem in {globs}; do
+    [ -f "$_sem" ] || continue
+    [ "$(od -An -tu4 -N4 "$_sem" 2>/dev/null | tr -d ' ')" = "0" ] || continue
+    grep -lF "${{_sem#/dev/shm/}}" /proc/[0-9]*/maps >/dev/null 2>&1 && continue
+    {action}
+done"#,
+        globs = BROKER_SEM_GLOBS,
+        action = action,
+    )
+}
+
 /// The shell script the running container's root runs (via `setns`) once per
 /// boot to recreate the session a PAM login would, so Intune works end to end:
 /// the per-user systemd manager (for `XDG_RUNTIME_DIR` + D-Bus session bus),
 /// an unlocked gnome-keyring with a created `login` collection, the Intune
 /// **compliance agent timer** (without it the device never reports compliant),
-/// and a broker restart so it re-reads the keyring. Mirrors the nspawn session.
+/// no stale broker lock left in `/dev/shm`, and a broker restart so it re-reads
+/// the keyring. Mirrors the nspawn session.
+///
+/// The display and the keyring daemon run as **transient user units**, never as
+/// bare background processes. The `setns` exec that runs this script is torn down
+/// with its cgroup, and every child of it dies at that moment — minutes after a
+/// boot that reported success.
 pub fn runtime_setup_script(user: &ContainerUser, headless: bool) -> String {
     // Headless (background SSO): the identity broker is a GTK app that exits
     // without a display, so start a private Xvfb and publish DISPLAY into the
     // user D-Bus activation environment (where the on-demand broker inherits it).
+    // `Restart=always` matters as much as the unit does: a dead :99 makes the
+    // broker exit at activation, and every token call then answers `NoReply` —
+    // which reads exactly like a locked keyring.
     let display_block = if headless {
-        r#"if command -v Xvfb >/dev/null 2>&1; then
-    pgrep -x Xvfb >/dev/null 2>&1 || setsid Xvfb :99 -screen 0 640x480x16 -nolisten tcp >/tmp/intune-xvfb.log 2>&1 &
+        r#"_xvfb=$(command -v Xvfb 2>/dev/null)
+if [ -n "$_xvfb" ]; then
+    if ! systemctl --user is-active --quiet intune-xvfb.service 2>/dev/null; then
+        systemctl --user reset-failed intune-xvfb.service >/dev/null 2>&1 || true
+        if ! systemd-run --user --unit=intune-xvfb --collect --quiet \
+                --property=Restart=always --property=RestartSec=1 \
+                "$_xvfb" :99 -screen 0 640x480x16 -nolisten tcp >/dev/null 2>&1; then
+            setsid "$_xvfb" :99 -screen 0 640x480x16 -nolisten tcp >/tmp/intune-xvfb.log 2>&1 &
+        fi
+    fi
     for _ in $(seq 1 20); do [ -S /tmp/.X11-unix/X99 ] && break; sleep 0.3; done
     export DISPLAY=:99 GDK_BACKEND=x11
     systemctl --user import-environment DISPLAY GDK_BACKEND >/dev/null 2>&1 || true
@@ -179,15 +225,29 @@ install -d -m 700 -o {uid} -g {uid} "{home}/.local" "{home}/.local/share" "{home
 # Unlock gnome-keyring with an EMPTY password (note: `echo ""` sends a newline =
 # empty password; `printf ''` would send EOF = no password and do nothing) and
 # force-create the default "login" collection so the broker can store secrets.
+# `--replace` takes the bus name from the instance D-Bus activated without a
+# password — that one can never unlock anything — so there is no pkill race to
+# lose. The unit keeps the unlocked daemon alive: D-Bus re-activates the
+# password-less variant the moment this one exits, and the keyring re-locks.
 if command -v gnome-keyring-daemon >/dev/null 2>&1; then
     _locked=$(busctl --user get-property org.freedesktop.secrets \
         /org/freedesktop/secrets/collection/login \
         org.freedesktop.Secret.Collection Locked 2>/dev/null)
     if [ "$_locked" != "b false" ]; then
-        pkill -x gnome-keyring-d 2>/dev/null || true
-        sleep 1
-        echo "" | gnome-keyring-daemon --unlock --components=secrets,pkcs11 -d >/dev/null 2>&1 || true
-        sleep 1
+        systemctl --user reset-failed intune-keyring-unlock.service >/dev/null 2>&1 || true
+        if ! systemd-run --user --unit=intune-keyring-unlock --collect --quiet \
+                --property=Restart=always --property=RestartSec=2 \
+                /bin/sh -c 'echo "" | gnome-keyring-daemon --replace --unlock --components=secrets,pkcs11 --foreground' >/dev/null 2>&1; then
+            pkill -x gnome-keyring-d 2>/dev/null || true
+            sleep 1
+            echo "" | gnome-keyring-daemon --unlock --components=secrets,pkcs11 -d >/dev/null 2>&1 || true
+        fi
+        for _ in $(seq 1 20); do
+            [ "$(busctl --user get-property org.freedesktop.secrets \
+                /org/freedesktop/secrets/collection/login \
+                org.freedesktop.Secret.Collection Locked 2>/dev/null)" = "b false" ] && break
+            sleep 0.5
+        done
     fi
     if ! secret-tool lookup _keyring_init _keyring_init >/dev/null 2>&1; then
         echo init | secret-tool store --label="Keyring Init" _keyring_init _keyring_init >/dev/null 2>&1 || true
@@ -202,6 +262,10 @@ systemctl --user import-environment XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS DIS
 systemctl --user start intune-agent.timer >/dev/null 2>&1 || true
 systemctl --user start intune-agent.service >/dev/null 2>&1 || true
 
+# Delete the locks a killed broker left behind, before anything asks it for a
+# token. The container has just booted, so nothing of ours holds one yet.
+{stale_locks}
+
 # Restart the device broker so it re-reads the now-initialized keyring.
 systemctl restart microsoft-identity-device-broker.service >/dev/null 2>&1 || true
 exit 0
@@ -210,6 +274,7 @@ exit 0
         home = user.home,
         name = user.name,
         display_block = display_block,
+        stale_locks = stale_broker_locks_script("rm -f \"$_sem\""),
     )
 }
 
@@ -260,13 +325,43 @@ mod tests {
         let s = runtime_setup_script(&u, true);
         assert!(s.contains("/run/user/0"));
         assert!(s.contains("keyrings/default"));
-        assert!(s.contains("gnome-keyring-daemon --unlock"));
+        assert!(s.contains("gnome-keyring-daemon --replace --unlock"));
         assert!(s.contains("secret-tool store"));
         assert!(s.contains("systemctl restart microsoft-identity-device-broker.service"));
         assert!(s.contains("intune-agent.timer"));
         assert!(s.contains("user@0.service"));
-        assert!(s.contains("Xvfb :99"));
+        assert!(s.contains(":99 -screen 0 640x480x16"));
         // Display-forwarded variant should NOT start Xvfb.
         assert!(!runtime_setup_script(&u, false).contains("Xvfb"));
+    }
+
+    #[test]
+    fn runtime_script_supervises_display_and_keyring_as_user_units() {
+        let u = ContainerUser {
+            uid: 0,
+            name: "root".into(),
+            home: "/root".into(),
+        };
+        let s = runtime_setup_script(&u, true);
+        // Both must be transient units with a restart policy: a child of this
+        // script dies with the setns exec's cgroup, and D-Bus then re-activates a
+        // keyring daemon that cannot unlock anything.
+        assert!(s.contains("systemd-run --user --unit=intune-xvfb"));
+        assert!(s.contains("systemd-run --user --unit=intune-keyring-unlock"));
+        assert_eq!(s.matches("--property=Restart=always").count(), 2);
+        // And the boot must clear the locks a killed broker left in /dev/shm.
+        assert!(s.contains("/dev/shm/sem.OneAuth_*"));
+        assert!(s.contains("rm -f \"$_sem\""));
+    }
+
+    #[test]
+    fn stale_lock_script_guards_on_counter_and_live_mapping() {
+        let s = stale_broker_locks_script("exit 1");
+        assert!(s.contains("/dev/shm/sem.OneAuth_*"));
+        assert!(s.contains("/dev/shm/sem.*-*-*-*-*:*"));
+        // A held counter (0) alone is not enough — a live mapping means in use.
+        assert!(s.contains("od -An -tu4 -N4"));
+        assert!(s.contains("/proc/[0-9]*/maps"));
+        assert!(s.contains("exit 1"));
     }
 }
