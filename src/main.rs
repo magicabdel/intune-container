@@ -21,7 +21,7 @@ use std::io::IsTerminal;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use intune_container::{config, doctor, ops};
+use intune_container::{autostart, config, doctor, ops};
 
 #[derive(Parser)]
 #[command(
@@ -84,6 +84,11 @@ enum Command {
     Stop,
     /// Show container status and detected display info
     Status,
+    /// Manage starting the container automatically on login and at boot
+    Autostart {
+        #[command(subcommand)]
+        action: AutostartAction,
+    },
     /// Run health checks across the whole stack
     Doctor,
     /// Backup Intune enrollment state (preserves registration across rebuilds)
@@ -153,6 +158,18 @@ enum Command {
     },
 }
 
+/// Actions for the `autostart` subcommand.
+#[derive(Subcommand)]
+enum AutostartAction {
+    /// Install and enable the systemd user service (starts on login; enables
+    /// lingering so it also starts at boot), then start it now
+    Enable,
+    /// Stop, disable, and remove the systemd user service
+    Disable,
+    /// Show whether autostart is installed, enabled, and active
+    Status,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -207,6 +224,11 @@ fn main() -> Result<()> {
         Command::Edge { verbose, args } => ops::edge(verbose, &args)?,
         Command::Stop => ops::stop()?,
         Command::Status => cmd_status()?,
+        Command::Autostart { action } => match action {
+            AutostartAction::Enable => autostart::enable()?,
+            AutostartAction::Disable => autostart::disable()?,
+            AutostartAction::Status => autostart::status()?,
+        },
         Command::Doctor => doctor::run()?,
         Command::Backup { output } => cmd_backup(output)?,
         Command::BackupInspect { input } => ops::backup_inspect(input.as_deref())?,

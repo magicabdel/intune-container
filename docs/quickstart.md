@@ -102,6 +102,21 @@ install the extension:
 Open `teams.microsoft.com` and it signs in automatically using the container's
 enrollment.
 
+### Start automatically on login and at boot (optional)
+
+```sh
+intune-container autostart enable
+```
+
+Installs a `systemd --user` service that runs `start` on login and `stop` on
+logout, and enables lingering so the container also comes up at boot before you
+log in. Check or undo it with:
+
+```sh
+intune-container autostart status
+intune-container autostart disable
+```
+
 ### Open Microsoft Edge
 
 ```sh
