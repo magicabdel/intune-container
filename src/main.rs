@@ -82,6 +82,20 @@ enum Command {
     },
     /// Sign in to Entra ID from this terminal (no screen, no VNC needed)
     Login {
+        /// Ask for an address and password to fill in. Not needed when this device
+        /// has signed in before: Entra remembers the account and goes straight to
+        /// the Authenticator prompt.
+        #[arg(long)]
+        fill: bool,
+
+        /// Work address to fill in (implies --fill; asked for when omitted)
+        #[arg(long, value_name = "ADDRESS")]
+        email: Option<String>,
+
+        /// Touch nothing — just show the window and drive it by hand
+        #[arg(long)]
+        manual: bool,
+
         /// Size of the private display the sign-in is drawn on
         #[arg(long, default_value = "1280x800", value_name = "WxH")]
         geometry: String,
@@ -232,7 +246,13 @@ fn main() -> Result<()> {
         Command::Enroll { image } => cmd_enroll(image)?,
         Command::Start => cmd_start()?,
         Command::Edge { verbose, args } => ops::edge(verbose, &args)?,
-        Command::Login { geometry, display } => cmd_login(&geometry, display)?,
+        Command::Login {
+            fill,
+            email,
+            manual,
+            geometry,
+            display,
+        } => cmd_login(fill, email, manual, &geometry, display)?,
         Command::Stop => ops::stop()?,
         Command::Status => cmd_status()?,
         Command::Autostart { action } => match action {
@@ -418,13 +438,29 @@ fn cmd_start() -> Result<()> {
     Ok(())
 }
 
-/// Sign in interactively with the window drawn in this terminal.
-fn cmd_login(geometry: &str, display: Option<u32>) -> Result<()> {
+/// Sign in from this terminal: the command fills the form, the reader approves the
+/// multi-factor prompt on their phone.
+fn cmd_login(
+    fill: bool,
+    email: Option<String>,
+    manual: bool,
+    geometry: &str,
+    display: Option<u32>,
+) -> Result<()> {
     let (width, height) = login::parse_geometry(geometry)?;
+    // Asked for BEFORE anything starts: a password prompt is the one thing that
+    // must not appear underneath a minute of container startup logs.
+    let credentials = if !manual && (fill || email.is_some()) {
+        Some(login::prompt_credentials(email)?)
+    } else {
+        None
+    };
     login::run(login::Options {
         width,
         height,
         display,
+        automatic: !manual,
+        credentials,
     })
 }
 

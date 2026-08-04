@@ -301,6 +301,23 @@ impl XScreen {
         Ok(true)
     }
 
+    /// Type a whole string, one key at a time.
+    ///
+    /// Returns the characters this display's keyboard could not produce, so the
+    /// caller can say which ones rather than silently signing in with half a
+    /// password. Paced deliberately: a web input with JavaScript handlers on every
+    /// keystroke drops characters typed at full XTEST speed.
+    pub fn type_text(&self, text: &str) -> Result<Vec<char>> {
+        let mut refused = Vec::new();
+        for c in text.chars() {
+            if !self.type_char(c)? {
+                refused.push(c);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(12));
+        }
+        Ok(refused)
+    }
+
     /// Send a named key.
     pub fn press(&self, key: Key) -> Result<bool> {
         let Some((code, shifted)) = self.keymap.lookup(key.keysym()) else {

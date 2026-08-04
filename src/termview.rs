@@ -82,6 +82,94 @@ impl Frame {
     }
 }
 
+/// A rectangle of the frame, in pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bounds {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// A pixel this dark in every channel is the empty desktop, not content. The
+/// portal's own background is near-white and every dialog has a border, so the
+/// threshold only has to clear black.
+const DESKTOP: u8 = 24;
+
+/// The smallest rectangle holding everything that is not empty desktop.
+///
+/// WHY IT MATTERS. The sign-in dialog is about 480×630 on a 1280×800 display, so
+/// two thirds of the screen is black and fitting the whole screen spends most of
+/// the terminal's cells on nothing. Cropping to the content is worth about a
+/// quarter — measured, not assumed, and less than it sounds because the dialog is
+/// TALL while a terminal has some hundred half-rows. That measurement is why
+/// [`Viewport::at_actual_size`] and not a fit is what the viewer opens on.
+///
+/// Returns the whole frame when it is empty, so a caller never has to special-case
+/// a blank display.
+pub fn content_bounds(frame: &Frame) -> Bounds {
+    let (mut x0, mut y0) = (frame.width, frame.height);
+    let (mut x1, mut y1) = (0u32, 0u32);
+    // Every other pixel: the dialog is hundreds of pixels wide, so a half-
+    // resolution scan finds the same box for a quarter of the work.
+    for y in (0..frame.height).step_by(2) {
+        for x in (0..frame.width).step_by(2) {
+            let p = frame.pixel(x, y);
+            if p[0] > DESKTOP || p[1] > DESKTOP || p[2] > DESKTOP {
+                x0 = x0.min(x);
+                y0 = y0.min(y);
+                x1 = x1.max(x);
+                y1 = y1.max(y);
+            }
+        }
+    }
+    if x1 <= x0 || y1 <= y0 {
+        return Bounds {
+            x: 0,
+            y: 0,
+            width: frame.width,
+            height: frame.height,
+        };
+    }
+    Bounds {
+        x: x0,
+        y: y0,
+        // +2 for the step, clamped: the scan can miss the last odd row/column.
+        width: (x1 - x0 + 2).min(frame.width - x0),
+        height: (y1 - y0 + 2).min(frame.height - y0),
+    }
+}
+
+/// How much two frames differ, as a fraction of the pixels compared.
+///
+/// This is how the automation knows a page changed without a DOM to ask: it types,
+/// then waits for the picture to move and then to settle. Sampled every fourth
+/// pixel in both directions, which is 16 times less work and still catches a
+/// dialog appearing.
+pub fn difference(a: &Frame, b: &Frame) -> f32 {
+    if a.width != b.width || a.height != b.height {
+        return 1.0;
+    }
+    let (mut differing, mut total) = (0u32, 0u32);
+    for y in (0..a.height).step_by(4) {
+        for x in (0..a.width).step_by(4) {
+            let p = a.pixel(x, y);
+            let q = b.pixel(x, y);
+            let delta = (p[0] as i32 - q[0] as i32).abs()
+                + (p[1] as i32 - q[1] as i32).abs()
+                + (p[2] as i32 - q[2] as i32).abs();
+            if delta > 24 {
+                differing += 1;
+            }
+            total += 1;
+        }
+    }
+    if total == 0 {
+        return 0.0;
+    }
+    differing as f32 / total as f32
+}
+
 /// Which part of the frame the terminal shows, and how magnified.
 ///
 /// `scale` is source pixels per cell across (and per half-cell down), so a
@@ -105,6 +193,39 @@ pub fn fit_scale(width: u32, height: u32, cols: u16, rows: u16) -> f32 {
 }
 
 impl Viewport {
+    /// Fit `bounds` — the window rather than the desktop around it — and keep the
+    /// rest of the frame reachable by panning.
+    pub fn fitted_to(bounds: Bounds, cols: u16, rows: u16) -> Self {
+        let scale = fit_scale(bounds.width, bounds.height, cols, rows);
+        let (vw, vh) = (cols as f32 * scale, rows as f32 * 2.0 * scale);
+        Self {
+            scale,
+            // Centre the content in the view, which letterboxes rather than
+            // cropping when the shapes do not match.
+            ox: bounds.x as f32 - (vw - bounds.width as f32) / 2.0,
+            oy: bounds.y as f32 - (vh - bounds.height as f32) / 2.0,
+        }
+    }
+
+    /// One pixel per half cell, anchored at the TOP of `bounds` and centred across
+    /// it.
+    ///
+    /// This is what the viewer opens on, and the reason is arithmetic: a terminal
+    /// has about 100 half-rows, the sign-in dialog is some 630 pixels tall, so
+    /// fitting it costs a factor of six and 13-pixel text becomes two rows of
+    /// colour. At actual size the same text is legible and the multi-factor number
+    /// — which is what a reader is actually here to read, and which Entra puts near
+    /// the top — is unmistakable. `F4` fits the whole window when a map is what is
+    /// wanted.
+    pub fn at_actual_size(bounds: Bounds, cols: u16, _rows: u16) -> Self {
+        let vw = cols as f32;
+        Self {
+            scale: 1.0,
+            ox: bounds.x as f32 + (bounds.width as f32 - vw) / 2.0,
+            oy: bounds.y as f32,
+        }
+    }
+
     /// The whole screen, centred.
     pub fn fitted(frame_w: u32, frame_h: u32, cols: u16, rows: u16) -> Self {
         let scale = fit_scale(frame_w, frame_h, cols, rows);
@@ -252,6 +373,7 @@ pub fn paint(prev: Option<&[Cell]>, next: &[Cell], cols: u16, rows: u16) -> Stri
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Key {
     Return,
+    Space,
     Tab,
     BackTab,
     BackSpace,
@@ -272,6 +394,8 @@ impl Key {
     pub fn keysym(self) -> u32 {
         match self {
             Key::Return => 0xff0d,
+            // Space activates a focused GTK button, which Enter does not.
+            Key::Space => 0x0020,
             Key::Tab | Key::BackTab => 0xff09,
             Key::BackSpace => 0xff08,
             Key::Delete => 0xffff,
@@ -531,6 +655,134 @@ pub const HELP: &[(&str, &str)] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A frame with a white rectangle on a black desktop, like the portal's dialog.
+    fn frame_with_window(w: u32, h: u32, win: Bounds) -> Frame {
+        let mut frame = Frame::flat(w, h, [0, 0, 0]);
+        for y in win.y..win.y + win.height {
+            for x in win.x..win.x + win.width {
+                let i = ((y * w + x) * 3) as usize;
+                frame.rgb[i] = 246;
+                frame.rgb[i + 1] = 245;
+                frame.rgb[i + 2] = 244;
+            }
+        }
+        frame
+    }
+
+    #[test]
+    fn the_content_box_is_the_window_not_the_desktop() {
+        let win = Bounds {
+            x: 100,
+            y: 60,
+            width: 200,
+            height: 300,
+        };
+        let found = content_bounds(&frame_with_window(1280, 800, win));
+        // Within the scan's two-pixel step.
+        assert!(found.x <= win.x && win.x - found.x <= 2, "{found:?}");
+        assert!(found.y <= win.y && win.y - found.y <= 2, "{found:?}");
+        assert!(found.width >= win.width && found.width <= win.width + 4, "{found:?}");
+        assert!(found.height >= win.height && found.height <= win.height + 4, "{found:?}");
+    }
+
+    #[test]
+    fn an_empty_display_reports_the_whole_frame() {
+        // Otherwise the viewer would have to special-case a display with no window
+        // yet — which is every display for the first half minute.
+        let found = content_bounds(&Frame::flat(800, 600, [0, 0, 0]));
+        assert_eq!(
+            found,
+            Bounds {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600
+            }
+        );
+    }
+
+    /// The real dialog, measured on the tenant: 480×630 at 1280×800.
+    const DIALOG: Bounds = Bounds {
+        x: 400,
+        y: 100,
+        width: 480,
+        height: 630,
+    };
+
+    #[test]
+    fn fitting_the_window_beats_fitting_the_screen_but_not_by_much() {
+        let whole = Viewport::fitted(1280, 800, 200, 50);
+        let cropped = Viewport::fitted_to(DIALOG, 200, 50);
+        assert!(
+            cropped.scale < whole.scale,
+            "cropping lost ground: {} vs {}",
+            cropped.scale,
+            whole.scale
+        );
+        // And it is only about a quarter better, because the dialog is TALL and a
+        // terminal has ~100 half-rows: the height binds, not the black desktop. This
+        // is why the viewer opens at actual size rather than fitted — a `fit` that
+        // reads as unusable would look like a broken renderer.
+        assert!(
+            cropped.scale > whole.scale / 2.0,
+            "if cropping ever gains this much, revisit the default view"
+        );
+        // The window is inside the view.
+        let (vw, vh) = cropped.covered(200, 50);
+        assert!(cropped.ox <= DIALOG.x as f32 && cropped.oy <= DIALOG.y as f32);
+        assert!(cropped.ox + vw >= (DIALOG.x + DIALOG.width) as f32);
+        assert!(cropped.oy + vh >= (DIALOG.y + DIALOG.height) as f32);
+    }
+
+    #[test]
+    fn actual_size_shows_the_top_of_the_window_centred() {
+        let vp = Viewport::at_actual_size(DIALOG, 200, 50);
+        assert_eq!(vp.scale, 1.0);
+        // The top edge, so the challenge text is on screen without panning.
+        assert_eq!(vp.oy, DIALOG.y as f32);
+        // Centred across the dialog: 480 wide, 200 columns → 140 px of margin each
+        // side.
+        assert_eq!(vp.ox, DIALOG.x as f32 + 140.0);
+        // And a terminal WIDER than the dialog still centres it rather than pushing
+        // it off to one side.
+        let wide = Viewport::at_actual_size(DIALOG, 600, 50);
+        assert_eq!(wide.ox, DIALOG.x as f32 - 60.0);
+    }
+
+    #[test]
+    fn actual_size_is_legible_where_fitting_is_not() {
+        // The measurement behind the default: 13-pixel body text and a ~40-pixel
+        // challenge number, in half-rows of terminal.
+        let fitted = Viewport::fitted_to(DIALOG, 200, 50);
+        let body_rows_fitted = 13.0 / fitted.scale;
+        let number_rows_fitted = 40.0 / fitted.scale;
+        assert!(body_rows_fitted < 3.0, "body text was legible when fitted?");
+        assert!(number_rows_fitted < 8.0);
+        let actual = Viewport::at_actual_size(DIALOG, 200, 50);
+        assert!(13.0 / actual.scale >= 13.0);
+        assert!(40.0 / actual.scale >= 40.0);
+    }
+
+    #[test]
+    fn difference_sees_a_dialog_appear_and_ignores_a_still_screen() {
+        let blank = Frame::flat(400, 300, [0, 0, 0]);
+        assert_eq!(difference(&blank, &blank), 0.0);
+        let with_window = frame_with_window(
+            400,
+            300,
+            Bounds {
+                x: 0,
+                y: 0,
+                width: 200,
+                height: 300,
+            },
+        );
+        // Half the screen changed; anything above a few percent is a real change.
+        assert!(difference(&blank, &with_window) > 0.4);
+        // A different size is treated as a total change rather than compared.
+        assert_eq!(difference(&blank, &Frame::flat(10, 10, [0, 0, 0])), 1.0);
+    }
 
     #[test]
     fn a_cell_averages_the_pixels_it_covers() {
