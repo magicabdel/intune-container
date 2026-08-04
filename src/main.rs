@@ -21,7 +21,7 @@ use std::io::IsTerminal;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use intune_container::{autostart, config, doctor, ops};
+use intune_container::{autostart, config, doctor, login, ops};
 
 #[derive(Parser)]
 #[command(
@@ -79,6 +79,16 @@ enum Command {
         /// Extra arguments passed to Edge
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
+    },
+    /// Sign in to Entra ID from this terminal (no screen, no VNC needed)
+    Login {
+        /// Size of the private display the sign-in is drawn on
+        #[arg(long, default_value = "1280x800", value_name = "WxH")]
+        geometry: String,
+
+        /// Use this X display number instead of the first free one
+        #[arg(long, value_name = "N")]
+        display: Option<u32>,
     },
     /// Stop the container
     Stop,
@@ -222,6 +232,7 @@ fn main() -> Result<()> {
         Command::Enroll { image } => cmd_enroll(image)?,
         Command::Start => cmd_start()?,
         Command::Edge { verbose, args } => ops::edge(verbose, &args)?,
+        Command::Login { geometry, display } => cmd_login(&geometry, display)?,
         Command::Stop => ops::stop()?,
         Command::Status => cmd_status()?,
         Command::Autostart { action } => match action {
@@ -405,6 +416,16 @@ fn cmd_start() -> Result<()> {
     eprintln!("Then open teams.microsoft.com — it signs in automatically via your");
     eprintln!("container's Intune enrollment. No Python, no proxy, no session-bus setup.");
     Ok(())
+}
+
+/// Sign in interactively with the window drawn in this terminal.
+fn cmd_login(geometry: &str, display: Option<u32>) -> Result<()> {
+    let (width, height) = login::parse_geometry(geometry)?;
+    login::run(login::Options {
+        width,
+        height,
+        display,
+    })
 }
 
 fn cmd_detach_display() -> Result<()> {

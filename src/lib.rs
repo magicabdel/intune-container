@@ -20,8 +20,18 @@ pub mod config;
 pub mod display;
 pub mod doctor;
 pub mod lock;
+pub mod login;
 pub mod native_host;
 pub mod ops;
+
+/// Drawing an X display in a terminal, and typing back into it (the pure half).
+pub mod termview;
+
+/// Reading an X display's pixels and synthesising its input (the X11 half).
+pub mod xscreen;
+
+/// The private, invisible X display a terminal sign-in runs on.
+pub mod xvfb;
 
 /// Pure-Rust OCI image pull + layer extraction (no docker/podman).
 pub mod oci;

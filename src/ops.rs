@@ -78,21 +78,35 @@ fn locked_ensure_running(config: &mut config::Config, with_display: bool) -> Res
 ///
 /// Callers must hold the lifecycle lock (use [`locked_ensure_running`]).
 fn ensure_running(config: &mut config::Config, with_display: bool) -> Result<()> {
+    ensure_running_on(config, with_display, &display::DisplayInfo::detect())
+}
+
+/// [`ensure_running`] against a display the caller names rather than the one this
+/// process inherited.
+///
+/// `login` needs this: its display is a private Xvfb it just created, so
+/// detection — which reads `$DISPLAY` — would find the user's session or nothing
+/// at all. Attaching binds the whole `/tmp/.X11-unix` directory, so a container
+/// that is *already* forwarding some display can reach the new socket without a
+/// restart; that is why this does not force one.
+fn ensure_running_on(
+    config: &mut config::Config,
+    with_display: bool,
+    display: &display::DisplayInfo,
+) -> Result<()> {
     if !config.initialized {
         anyhow::bail!("Not set up yet. Run:  intune-container enroll");
     }
 
-    let display = display::DisplayInfo::detect();
-
     if backend::is_running(config) {
         if with_display && !config.display_forwarding {
-            backend::attach_display(config, &display)?;
+            backend::attach_display(config, display)?;
         }
         return Ok(());
     }
 
     debug!("Container not running — starting it...");
-    boot(config, &display, with_display)?;
+    boot(config, display, with_display)?;
     Ok(())
 }
 
@@ -163,6 +177,61 @@ pub fn enroll() -> Result<bool> {
     }
 
     Ok(closed)
+}
+
+// ===== Login (terminal sign-in) =====
+
+/// Bring the container up with `display` attached and launch the Intune portal on
+/// it, in the background.
+///
+/// The three halves of a terminal sign-in are split so [`crate::login`] can drive
+/// the window between them: this starts it, [`portal_is_running`] says whether it
+/// is still there, and [`portal_finish`] puts the container back the way it was.
+/// `enroll` does the same three things in one call because it has a real screen
+/// to wait on.
+pub fn portal_start(display: &display::DisplayInfo) -> Result<()> {
+    let mut config =
+        config::Config::load().context("Not set up yet. Run:  intune-container enroll")?;
+    {
+        let _lock = lock::LifecycleLock::acquire()?;
+        ensure_running_on(&mut config, true, display)?;
+    }
+
+    // Gate on the container's own services, exactly as enrollment does: a portal
+    // started before the broker is up dies with "Message recipient disconnected".
+    backend::wait_until_portal_ready(&config);
+
+    info!("Starting the Intune portal — its window can take up to ~30s the first time.");
+    backend::exec(&config, "intune-portal", None, display)
+}
+
+/// Whether the portal window is still open. False also when the container is not
+/// running at all, which is the same thing from the viewer's point of view.
+pub fn portal_is_running() -> bool {
+    let Ok(config) = config::Config::load() else {
+        return false;
+    };
+    backend::probe(
+        &config,
+        "pgrep -u \"$(id -u)\" -x intune-portal >/dev/null 2>&1",
+    ) == 0
+}
+
+/// Close the portal window. Used when the reader quits the viewer with the window
+/// still open: the display is about to be destroyed, and a portal drawing into a
+/// display that no longer exists is a process nobody can reach.
+pub fn portal_stop() -> Result<()> {
+    let config = config::Config::load().context("Failed to load configuration")?;
+    // TERM, never KILL: the portal writes the broker's account state on the way
+    // out, and half-written state is worse than a window left open.
+    backend::probe(&config, "pkill -u \"$(id -u)\" -x intune-portal");
+    Ok(())
+}
+
+/// Return the container to headless isolation after a terminal sign-in.
+pub fn portal_finish() -> Result<()> {
+    let mut config = config::Config::load().context("Failed to load configuration")?;
+    auto_detach_after_gui(&mut config)
 }
 
 // ===== Edge =====
