@@ -133,22 +133,32 @@ fn seed_keyring_dir(rootfs: &Path, user: &ContainerUser) -> Result<()> {
 /// an unlocked gnome-keyring with a created `login` collection, the Intune
 /// **compliance agent timer** (without it the device never reports compliant),
 /// and a broker restart so it re-reads the keyring. Mirrors the nspawn session.
-pub fn runtime_setup_script(user: &ContainerUser, headless: bool) -> String {
-    // Headless (background SSO): the identity broker is a GTK app that exits
-    // without a display, so start a private Xvfb and publish DISPLAY into the
-    // user D-Bus activation environment (where the on-demand broker inherits it).
-    let display_block = if headless {
-        r#"if command -v Xvfb >/dev/null 2>&1; then
+/// Start the container's own private display and publish it to the D-Bus
+/// activation environment, so the on-demand identity broker inherits a display
+/// that exists.
+///
+/// The broker is a GTK program: with no reachable `DISPLAY` it exits at activation
+/// and every token call answers `NoReply`, which reads exactly like a locked
+/// keyring. It has to be a display the CONTAINER owns, and that is the whole point
+/// of `:99` — a forwarded host display works while the app using it is up, and
+/// leaves the broker pointing at nothing the moment it goes. That happened: a
+/// `login` session published its private Xvfb here through the login-shell profile,
+/// was killed, and the broker then failed with `cannot open display: :77` until
+/// somebody read the container's own journal.
+pub const BROKER_DISPLAY_SCRIPT: &str = r#"if command -v Xvfb >/dev/null 2>&1; then
     pgrep -x Xvfb >/dev/null 2>&1 || setsid Xvfb :99 -screen 0 640x480x16 -nolisten tcp >/tmp/intune-xvfb.log 2>&1 &
     for _ in $(seq 1 20); do [ -S /tmp/.X11-unix/X99 ] && break; sleep 0.3; done
     export DISPLAY=:99 GDK_BACKEND=x11
     systemctl --user import-environment DISPLAY GDK_BACKEND >/dev/null 2>&1 || true
     dbus-update-activation-environment --systemd DISPLAY GDK_BACKEND >/dev/null 2>&1 || true
 fi
-"#
-    } else {
-        ""
-    };
+"#;
+
+pub fn runtime_setup_script(user: &ContainerUser, headless: bool) -> String {
+    // Headless (background SSO): the identity broker is a GTK app that exits
+    // without a display, so start a private Xvfb and publish DISPLAY into the
+    // user D-Bus activation environment (where the on-demand broker inherits it).
+    let display_block = if headless { BROKER_DISPLAY_SCRIPT } else { "" };
     format!(
         r#"# Wait for the system to finish booting (logind + system bus).
 for _ in $(seq 1 90); do

@@ -202,7 +202,22 @@ pub fn portal_start(display: &display::DisplayInfo) -> Result<()> {
     backend::wait_until_portal_ready(&config);
 
     info!("Starting the Intune portal — its window can take up to ~30s the first time.");
-    backend::exec(&config, "intune-portal", None, display)
+    backend::exec(&config, "intune-portal", None, display)?;
+
+    // Take the broker off our display and put it back on the container's own.
+    //
+    // The portal is launched through a login shell, and the session profile
+    // publishes whatever DISPLAY it is given into the D-Bus activation
+    // environment — so without this the BROKER inherits the private display this
+    // command created, and dies with `cannot open display` the moment the command
+    // ends. That is not a small bug: every token call then fails, the app reports a
+    // broken sign-in, and the automatic repair restarts the container against a
+    // cause a restart cannot fix.
+    //
+    // The portal keeps its own DISPLAY (it was given one in its environment); only
+    // what the broker inherits is changed back.
+    backend::probe(&config, crate::provision::BROKER_DISPLAY_SCRIPT);
+    Ok(())
 }
 
 /// Whether the portal window is still open. False also when the container is not
@@ -692,4 +707,37 @@ fn remove_browser_sso_integration(home: &str) {
         let _ = std::fs::remove_file(format!("{dir}/linux_entra_sso.json"));
     }
     let _ = std::fs::remove_dir_all(format!("{home}/.local/lib/intune-container"));
+}
+
+#[cfg(test)]
+mod tests {
+    /// The one thing a terminal sign-in must never leave behind: the broker
+    /// pointing at the private display the command created.
+    ///
+    /// It is checked on the SCRIPT rather than on a live container, because the
+    /// failure is silent — the sign-in works, the command exits, and the account
+    /// breaks minutes later with an error that names a keyring.
+    #[test]
+    fn the_portal_puts_the_broker_back_on_the_container_display() {
+        let script = crate::provision::BROKER_DISPLAY_SCRIPT;
+        assert!(script.contains("DISPLAY=:99"), "the container's own display");
+        assert!(
+            script.contains("dbus-update-activation-environment"),
+            "publishing it is what the broker inherits"
+        );
+        // And it starts that display rather than assuming it: a container booted
+        // with a host display forwarded has no :99 running.
+        assert!(script.contains("Xvfb :99"));
+
+        let source = include_str!("ops.rs");
+        let start = source
+            .split("pub fn portal_start")
+            .nth(1)
+            .expect("portal_start exists");
+        let body = start.split("\n}\n").next().unwrap_or(start);
+        assert!(
+            body.contains("BROKER_DISPLAY_SCRIPT"),
+            "portal_start must restore the broker's display before it returns"
+        );
+    }
 }
