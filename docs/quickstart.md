@@ -134,6 +134,23 @@ intune-container doctor    # health checks across the stack
 intune-container stop      # shut the container down
 ```
 
+### Keep the image up to date
+
+The rootfs records the digest of the image it was extracted from. On every start,
+the registry is asked (one HEAD request) what `:latest` points to now; if the
+digest moved, the image is re-pulled and the rootfs rebuilt before boot. Your
+enrollment survives — device registration, tokens and the keyring live outside
+the rootfs.
+
+```sh
+intune-container update --check   # compare local vs registry digest, download nothing
+intune-container update           # re-pull if the digest changed (restarts if running)
+intune-container update --force   # re-pull unconditionally
+```
+
+To pin the rootfs and skip the check, set `auto_update = false` in
+`~/.local/share/intune-container/config.toml`; `update` still works on demand.
+
 ### Back up / restore enrollment
 
 ```sh

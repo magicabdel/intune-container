@@ -45,9 +45,12 @@ pub fn initialize(config: &mut Config, _password: &str, image: Option<&str>) -> 
     config.rootfs_path = rootfs.clone();
     let image = image.unwrap_or(DEFAULT_IMAGE);
     info!(%image, dest = %rootfs.display(), "Provisioning rootless rootfs...");
-    crate::oci::pull_rootfs(image, &rootfs).context("failed to pull/extract the rootfs")?;
+    let digest =
+        crate::oci::pull_rootfs(image, &rootfs).context("failed to pull/extract the rootfs")?;
+    // Remember the reference so updates re-pull the same image.
+    config.image = Some(image.to_string());
     provision::provision(&rootfs, &run_user()).context("failed to provision the rootfs")?;
-    info!("rootfs provisioned (session profile + keyring)");
+    info!(%digest, "rootfs provisioned (session profile + keyring)");
     Ok(())
 }
 
@@ -63,12 +66,15 @@ pub fn remove_rootfs(config: &Config) -> Result<()> {
 /// Boot the container, forwarding the host display when `with_display`.
 pub fn start(config: &mut Config, _display: &DisplayInfo, with_display: bool) -> Result<()> {
     runtime::preflight().context("this host can't run the rootless backend")?;
-    ensure_rootfs(config)?;
 
+    // Check this *before* touching the rootfs: a running container must never
+    // have its filesystem re-pulled from under it by the update check below.
     if matches!(runtime::running_leader(), Ok(Some(_))) {
         debug!("container already running");
         return Ok(());
     }
+
+    ensure_rootfs(config)?;
 
     spawn_supervisor(with_display)?;
 
@@ -484,22 +490,170 @@ fn session_env(user: &ContainerUser, display: &DisplayInfo) -> Vec<(String, Stri
     env
 }
 
-/// Ensure the rootfs is present (pull on first use) and provisioned.
+/// Ensure the rootfs is present (pull on first use) and provisioned. When
+/// [`Config::auto_update`] is set, also re-pulls it if the image's digest in the
+/// registry no longer matches the one the rootfs was extracted from.
+///
+/// Callers must ensure the container is **not** running (the rootfs is replaced
+/// in place on an update).
 fn ensure_rootfs(config: &mut Config) -> Result<PathBuf> {
     let rootfs = rootless_rootfs(config);
     if config.rootfs_path != rootfs {
         config.rootfs_path = rootfs.clone();
     }
-    let populated = rootfs.join("sbin/init").exists() || rootfs.join("usr/sbin/init").exists();
-    if !populated {
-        info!(image = %DEFAULT_IMAGE, dest = %rootfs.display(), "Pulling rootfs (pure Rust OCI)...");
-        crate::oci::pull_rootfs(DEFAULT_IMAGE, &rootfs)
+    let image = image_ref(config).to_string();
+    if !is_populated(&rootfs) {
+        info!(%image, dest = %rootfs.display(), "Pulling rootfs (pure Rust OCI)...");
+        let digest = crate::oci::pull_rootfs(&image, &rootfs)
             .context("failed to pull/extract the rootfs")?;
+        info!(%digest, "rootfs extracted");
+    } else if config.auto_update {
+        // A registry hiccup (offline laptop, GHCR down) must not block a boot:
+        // keep the rootfs we already have.
+        if let Err(e) = auto_update_rootfs(&rootfs, &image) {
+            warn!(error = %format!("{e:#}"), "skipping the image update check");
+        }
     }
     // Provisioning is idempotent; run it on every start so an existing rootfs
     // picks up updates too.
     provision::provision(&rootfs, &run_user()).context("failed to provision the rootfs")?;
     Ok(rootfs)
+}
+
+/// Whether `rootfs` holds an extracted image (has an init to boot).
+fn is_populated(rootfs: &Path) -> bool {
+    rootfs.join("sbin/init").exists() || rootfs.join("usr/sbin/init").exists()
+}
+
+/// The image the rootfs is built from: the one recorded at `init --image` time,
+/// else the published default.
+pub fn image_ref(config: &Config) -> &str {
+    config.image.as_deref().unwrap_or(DEFAULT_IMAGE)
+}
+
+/// The local rootfs's image digest next to the registry's current one for the
+/// same reference. One HEAD request; no layers are downloaded.
+pub fn image_status(config: &Config) -> Result<ImageStatus> {
+    let image = image_ref(config).to_string();
+    let remote = crate::oci::remote_digest(&image)?;
+    Ok(ImageStatus {
+        local: crate::oci::local_digest(&rootless_rootfs(config)),
+        image,
+        remote,
+    })
+}
+
+/// Where the local rootfs stands relative to the registry.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ImageStatus {
+    /// Image reference that was compared (e.g. `…/intune-container:latest`).
+    pub image: String,
+    /// Digest the local rootfs was extracted from, if it is stamped.
+    pub local: Option<String>,
+    /// Digest the tag currently resolves to in the registry.
+    pub remote: String,
+}
+
+impl ImageStatus {
+    /// True when the registry's digest differs from the local one. An unstamped
+    /// rootfs (unknown local digest) counts as out of date.
+    pub fn update_available(&self) -> bool {
+        self.local.as_deref() != Some(self.remote.as_str())
+    }
+}
+
+/// What [`update_rootfs`] did.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UpdateOutcome {
+    pub image: String,
+    /// Digest before the update (if the rootfs was stamped).
+    pub previous: Option<String>,
+    /// Digest the rootfs is on now.
+    pub digest: String,
+    /// False when the local rootfs already matched the registry.
+    pub updated: bool,
+}
+
+/// Re-pull the image when the registry's digest differs from the local rootfs's
+/// (or unconditionally with `force`), then re-provision. Persistent enrollment
+/// state lives outside the rootfs ([`persist_dir`]), so replacing it is safe.
+///
+/// The container must be stopped — the caller stops it and restarts it after.
+pub fn update_rootfs(config: &mut Config, force: bool) -> Result<UpdateOutcome> {
+    runtime::preflight().context("this host can't run the rootless backend")?;
+    anyhow::ensure!(
+        !matches!(runtime::running_leader(), Ok(Some(_))),
+        "the container is running — stop it before updating the rootfs"
+    );
+
+    let rootfs = rootless_rootfs(config);
+    if config.rootfs_path != rootfs {
+        config.rootfs_path = rootfs.clone();
+    }
+    let status = image_status(config)?;
+
+    if !force && is_populated(&rootfs) && !status.update_available() {
+        info!(image = %status.image, digest = %status.remote, "rootfs is already up to date");
+        return Ok(UpdateOutcome {
+            image: status.image,
+            previous: status.local,
+            digest: status.remote,
+            updated: false,
+        });
+    }
+
+    info!(
+        image = %status.image,
+        from = status.local.as_deref().unwrap_or("unknown"),
+        to = %status.remote,
+        "Pulling a new rootfs..."
+    );
+    let digest = replace_rootfs(&rootfs, &status.image)?;
+    provision::provision(&rootfs, &run_user()).context("failed to provision the rootfs")?;
+    info!(%digest, "rootfs updated");
+
+    Ok(UpdateOutcome {
+        image: status.image,
+        previous: status.local,
+        digest,
+        updated: true,
+    })
+}
+
+/// Compare the stamped digest against the registry and re-pull on a mismatch.
+///
+/// An unstamped rootfs (pulled by an older version, so its digest is unknown) is
+/// adopted as-is: we record the current remote digest as its baseline rather
+/// than force a multi-hundred-MB download the user didn't ask for. The next time
+/// the tag moves, the mismatch is real and triggers the update.
+fn auto_update_rootfs(rootfs: &Path, image: &str) -> Result<()> {
+    let remote = crate::oci::remote_digest(image)?;
+    match crate::oci::local_digest(rootfs) {
+        Some(local) if local == remote => {
+            debug!(%image, digest = %remote, "rootfs is up to date");
+        }
+        Some(local) => {
+            info!(%image, from = %local, to = %remote, "New image published — re-pulling the rootfs...");
+            let digest = replace_rootfs(rootfs, image)?;
+            info!(%digest, "rootfs updated");
+        }
+        None => {
+            debug!(%image, digest = %remote, "stamping the existing rootfs with the current digest");
+            crate::oci::write_local_digest(rootfs, &remote)?;
+        }
+    }
+    Ok(())
+}
+
+/// Delete the rootfs and extract `image` fresh into it, returning the new
+/// digest. A fresh extract (rather than layering the new image over the old
+/// tree) is what removes files the new image dropped. Some files are owned by a
+/// mapped subuid, hence the user-namespace removal.
+fn replace_rootfs(rootfs: &Path, image: &str) -> Result<String> {
+    if rootfs.exists() {
+        runtime::remove_tree_as_root(rootfs).context("failed to remove the old rootfs")?;
+    }
+    crate::oci::pull_rootfs(image, rootfs).context("failed to pull/extract the rootfs")
 }
 
 /// Run `command` as the container user with the display environment, via

@@ -480,6 +480,78 @@ pub fn backup_inspect(input: Option<&Path>) -> Result<()> {
     backup::inspect(input)
 }
 
+// ===== Image updates =====
+
+/// What [`update`] found/did.
+#[derive(Debug, Clone, Serialize)]
+pub struct UpdateReport {
+    /// Image reference that was checked.
+    pub image: String,
+    /// Digest the rootfs was on before (None if it was never stamped).
+    pub previous: Option<String>,
+    /// Digest in the registry (and, after an update, of the local rootfs).
+    pub digest: String,
+    /// Whether the rootfs was re-pulled.
+    pub updated: bool,
+    /// Whether the container was stopped and restarted around the update.
+    pub restarted: bool,
+}
+
+/// Compare the local rootfs's image digest with the registry's and, if they
+/// differ (or `force`), re-pull the image and re-provision.
+///
+/// A running container is stopped for the swap and started again afterwards in
+/// the same display mode. Enrollment state lives outside the rootfs, so it
+/// survives. With `check_only`, nothing is downloaded or stopped — the report
+/// just says whether an update is available.
+pub fn update(force: bool, check_only: bool) -> Result<UpdateReport> {
+    let mut config = config::Config::load().context("Failed to load configuration")?;
+
+    if check_only {
+        let status = backend::image_status(&config)?;
+        return Ok(UpdateReport {
+            image: status.image,
+            previous: status.local.clone(),
+            digest: status.remote,
+            updated: false,
+            restarted: false,
+        });
+    }
+
+    let _lock = lock::LifecycleLock::acquire()?;
+
+    let was_running = backend::is_running(&config);
+    let with_display = was_running && config.display_forwarding;
+    if was_running {
+        // Nothing may be executing out of the rootfs while it is replaced.
+        info!("Stopping the container to swap its rootfs...");
+        backend::stop(&config).context("Failed to stop container")?;
+    }
+
+    let outcome = backend::update_rootfs(&mut config, force);
+
+    // Bring the container back up even if the pull failed, so a transient
+    // registry error doesn't leave the user without a running container.
+    let mut restarted = false;
+    if was_running {
+        let display = display::DisplayInfo::detect();
+        match boot(&mut config, &display, with_display) {
+            Ok(()) => restarted = true,
+            Err(e) => warn!(error = %format!("{e:#}"), "could not restart the container"),
+        }
+    }
+    config.save()?;
+
+    let outcome = outcome?;
+    Ok(UpdateReport {
+        image: outcome.image,
+        previous: outcome.previous,
+        digest: outcome.digest,
+        updated: outcome.updated,
+        restarted,
+    })
+}
+
 // ===== Status =====
 
 /// A snapshot of container + host display state. Never fails to produce: when
@@ -495,6 +567,12 @@ pub struct StatusReport {
     pub rootfs_path: String,
     pub host_user: String,
     pub host_uid: u32,
+    /// Image the rootfs is built from.
+    pub image: String,
+    /// Digest the local rootfs was extracted from (None if unstamped).
+    pub image_digest: Option<String>,
+    /// Whether start re-pulls the image when its digest changes.
+    pub auto_update: bool,
     pub compositor: String,
     pub wayland: Option<String>,
     pub x11_display: Option<String>,
@@ -533,6 +611,9 @@ pub fn status() -> StatusReport {
         report.rootfs_path = config.rootfs_path.display().to_string();
         report.host_user = config.host_user.clone();
         report.host_uid = config.host_uid;
+        report.image = backend::image_ref(&config).to_string();
+        report.image_digest = crate::oci::local_digest(&config.rootfs_path);
+        report.auto_update = config.auto_update;
     }
 
     report

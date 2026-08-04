@@ -40,6 +40,17 @@ pub struct Config {
     /// (often mode 700 root) and isn't readable by the unprivileged user.
     #[serde(default)]
     pub initialized: bool,
+
+    /// OCI image the rootfs was built from (`init --image`). `None` means the
+    /// built-in default; kept so updates re-pull the same reference.
+    #[serde(default)]
+    pub image: Option<String>,
+
+    /// Check the registry on start and re-pull the rootfs when the image's
+    /// digest changed (a tag like `:latest` moving to a new build). Set to
+    /// `false` to pin the rootfs to whatever was pulled last. Default: true.
+    #[serde(default = "default_true")]
+    pub auto_update: bool,
 }
 
 impl Default for Config {
@@ -55,6 +66,8 @@ impl Default for Config {
             expose_bus: false,
             display_forwarding: false,
             initialized: false,
+            image: None,
+            auto_update: true,
         }
     }
 }
@@ -144,6 +157,11 @@ impl Config {
         }
         Ok(())
     }
+}
+
+/// `serde` default for boolean fields that opt in by default.
+fn default_true() -> bool {
+    true
 }
 
 /// Resolve the per-user data directory (`$XDG_DATA_HOME` or `~/.local/share`)

@@ -120,6 +120,7 @@ or no cgroup v2) get a clear preflight error from `enroll`/`status`.
 ```sh
 intune-container -v enroll     # verbose: show display detection + readiness
 intune-container status        # container + display + SSO state
+intune-container update --check # local rootfs digest vs the registry's
 intune-container doctor        # health checks across the stack
 intune-container sso-test      # query the broker directly (SSO debugging)
 intune-container shell         # open a shell inside the container

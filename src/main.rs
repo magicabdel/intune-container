@@ -82,6 +82,16 @@ enum Command {
     },
     /// Stop the container
     Stop,
+    /// Re-pull the container image when the registry has a newer build
+    Update {
+        /// Only report whether a newer image is available (downloads nothing)
+        #[arg(long)]
+        check: bool,
+
+        /// Re-pull even when the digest already matches
+        #[arg(short, long)]
+        force: bool,
+    },
     /// Show container status and detected display info
     Status,
     /// Manage starting the container automatically on login and at boot
@@ -223,6 +233,7 @@ fn main() -> Result<()> {
         Command::Start => cmd_start()?,
         Command::Edge { verbose, args } => ops::edge(verbose, &args)?,
         Command::Stop => ops::stop()?,
+        Command::Update { check, force } => cmd_update(check, force)?,
         Command::Status => cmd_status()?,
         Command::Autostart { action } => match action {
             AutostartAction::Enable => autostart::enable()?,
@@ -423,6 +434,19 @@ fn cmd_status() -> Result<()> {
     println!();
     println!("Machine:      {}", s.machine_name);
     println!("Rootfs:       {}", s.rootfs_path);
+    println!("Image:        {}", s.image);
+    println!(
+        "Image digest: {} ({})",
+        s.image_digest
+            .as_deref()
+            .map(short_digest)
+            .unwrap_or_else(|| "unknown".into()),
+        if s.auto_update {
+            "auto-update on"
+        } else {
+            "auto-update off"
+        }
+    );
     println!("Running:      {}", if s.running { "yes" } else { "no" });
     println!("Host user:    {} (uid {})", s.host_user, s.host_uid);
     println!(
@@ -463,6 +487,50 @@ fn cmd_status() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Check the registry for a new image digest and re-pull the rootfs if it moved.
+fn cmd_update(check: bool, force: bool) -> Result<()> {
+    let report = ops::update(force, check)?;
+
+    if check {
+        let local = report.previous.as_deref();
+        println!("Image:   {}", report.image);
+        println!(
+            "Local:   {}",
+            local.map(short_digest).unwrap_or_else(|| "unknown".into())
+        );
+        println!("Remote:  {}", short_digest(&report.digest));
+        if local == Some(report.digest.as_str()) {
+            eprintln!("✓ Up to date.");
+        } else {
+            eprintln!("→ A newer image is available. Update with:  intune-container update");
+        }
+        return Ok(());
+    }
+
+    if report.updated {
+        eprintln!(
+            "✓ Rootfs updated to {} ({})",
+            short_digest(&report.digest),
+            report.image
+        );
+        if report.restarted {
+            eprintln!("  Container restarted on the new rootfs.");
+        }
+    } else {
+        eprintln!(
+            "✓ Already on the latest image ({}).",
+            short_digest(&report.digest)
+        );
+    }
+    Ok(())
+}
+
+/// `sha256:abcdef0123456789…` → `abcdef012345` for human-facing output.
+fn short_digest(digest: &str) -> String {
+    let hex = digest.split_once(':').map_or(digest, |(_, hex)| hex);
+    hex.chars().take(12).collect()
 }
 
 fn cmd_backup(output: Option<std::path::PathBuf>) -> Result<()> {

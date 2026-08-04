@@ -61,12 +61,14 @@ intune-container enroll   # set up + enroll your device (opens the portal)
 intune-container start    # (optional) run headless + seamless Teams/M365 SSO
 ```
 
-Daily CLI use: `edge` · `status` · `doctor` · `stop`. Full walkthrough in the
-**[Quickstart](docs/quickstart.md)**.
+Daily CLI use: `edge` · `status` · `update` · `doctor` · `stop`. Full walkthrough
+in the **[Quickstart](docs/quickstart.md)**.
 
 The default container image is publicly hosted and ready to go (it already
 includes everything for headless SSO) — there's nothing to build, and no
-container engine is needed: the image is pulled with a built-in OCI client.
+container engine is needed: the image is pulled with a built-in OCI client. Each
+start compares the image's digest in the registry against the one the rootfs was
+extracted from and re-pulls only when it changed (`update --check` shows both).
 
 > **Requirements:** a Linux host with **unprivileged user namespaces enabled**,
 > a `/etc/subuid` + `/etc/subgid` range for your user, `newuidmap`/`newgidmap`
