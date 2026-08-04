@@ -6,6 +6,44 @@ to follow [Semantic Versioning](https://semver.org/) once it reaches 1.0.
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-08-04
+
+### Added
+
+- **`update` command + automatic image updates.** The rootfs now records the
+  digest of the image it was extracted from, and every start asks the registry
+  (one HEAD request) whether the tag moved — if so, the image is re-pulled and
+  the rootfs rebuilt before boot. Enrollment survives: device registration,
+  tokens, and the keyring live outside the rootfs. `update --check` compares
+  local vs. registry digests without downloading; `update --force` re-pulls
+  unconditionally; `auto_update = false` in the config pins the rootfs. `status`
+  now shows the image reference and digest. A registry hiccup never blocks a
+  boot — the existing rootfs is kept.
+  ([@magicabdel](https://github.com/magicabdel))
+- **`autostart` command** (`enable`/`disable`/`status`) — run the container on
+  login and at boot via a `systemd --user` unit: `start` on login, `stop` on
+  logout, with lingering enabled so it also comes up at boot before any
+  interactive session. Idempotent, reversible, and the unit pins the absolute
+  path of the current binary so it keeps working regardless of `PATH` at boot.
+  ([@theophile-wallez](https://github.com/theophile-wallez),
+  [#2](https://github.com/magicabdel/intune-container/pull/2))
+
+### Fixed
+
+- **Sign-in silently lost minutes after boot** — every token call answered with
+  no account while enrollment, the bus, and the keyring all read healthy. Three
+  faults produced the one symptom: (1) `Xvfb` and the unlocking
+  `gnome-keyring-daemon` ran as children of the session-setup exec and died with
+  its cgroup — they now run as transient user units with `Restart=always`, and
+  the keyring daemon takes the bus name with `--replace` instead of racing
+  `pkill` against D-Bus activation; (2) stale broker POSIX semaphores in
+  `/dev/shm` (shared with the host) left at 0 by a broker killed mid-call made
+  `getAccounts` block 15 s and answer empty — boot now clears locks no live
+  process maps; (3) `doctor` gained the two missing checks — *Virtual display*
+  and *Broker locks* — and each broker check now names a distinct cause.
+  ([@theophile-wallez](https://github.com/theophile-wallez),
+  [#3](https://github.com/magicabdel/intune-container/pull/3))
+
 ## [0.2.1] - 2026-07-06
 
 ### Fixed
