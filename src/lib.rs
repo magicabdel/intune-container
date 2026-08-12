@@ -33,6 +33,9 @@ pub mod xscreen;
 /// The private, invisible X display a terminal sign-in runs on.
 pub mod xvfb;
 
+/// Serving that same display to a browser, over the tailnet (`login --web`).
+pub mod webview;
+
 /// Pure-Rust OCI image pull + layer extraction (no docker/podman).
 pub mod oci;
 

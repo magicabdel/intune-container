@@ -21,7 +21,7 @@ use std::io::IsTerminal;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use intune_container::{autostart, config, doctor, login, ops};
+use intune_container::{autostart, config, doctor, login, ops, webview};
 
 #[derive(Parser)]
 #[command(
@@ -103,6 +103,20 @@ enum Command {
         /// Use this X display number instead of the first free one
         #[arg(long, value_name = "N")]
         display: Option<u32>,
+
+        /// Serve the window to a browser instead of drawing it here. It listens on
+        /// this host's tailnet address, so any device in your tailnet can open it.
+        #[arg(long)]
+        web: bool,
+
+        /// Address the browser viewer listens on (default: the tailnet address, or
+        /// 127.0.0.1 when there is none)
+        #[arg(long, value_name = "ADDR", requires = "web")]
+        bind: Option<std::net::IpAddr>,
+
+        /// Port the browser viewer listens on
+        #[arg(long, value_name = "N", requires = "web")]
+        port: Option<u16>,
     },
     /// Stop the container
     Stop,
@@ -252,7 +266,17 @@ fn main() -> Result<()> {
             manual,
             geometry,
             display,
-        } => cmd_login(fill, email, manual, &geometry, display)?,
+            web,
+            bind,
+            port,
+        } => cmd_login(
+            fill,
+            email,
+            manual,
+            &geometry,
+            display,
+            web.then(|| webview::Options::resolved(bind, port)),
+        )?,
         Command::Stop => ops::stop()?,
         Command::Status => cmd_status()?,
         Command::Autostart { action } => match action {
@@ -438,14 +462,16 @@ fn cmd_start() -> Result<()> {
     Ok(())
 }
 
-/// Sign in from this terminal: the command fills the form, the reader approves the
-/// multi-factor prompt on their phone.
+/// Sign in from this terminal — or, with `--web`, from a browser on the tailnet:
+/// the command fills the form, the reader approves the multi-factor prompt on their
+/// phone.
 fn cmd_login(
     fill: bool,
     email: Option<String>,
     manual: bool,
     geometry: &str,
     display: Option<u32>,
+    web: Option<webview::Options>,
 ) -> Result<()> {
     let (width, height) = login::parse_geometry(geometry)?;
     // Asked for BEFORE anything starts: a password prompt is the one thing that
@@ -461,6 +487,7 @@ fn cmd_login(
         display,
         automatic: !manual,
         credentials,
+        web,
     })
 }
 

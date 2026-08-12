@@ -17,6 +17,10 @@
 //! keys and clicks back with XTEST ([`crate::xscreen`]). The reader types their
 //! address and password in the terminal and reads the Authenticator number there.
 //!
+//! `--web` swaps that last part for a browser ([`crate::webview`]): the same
+//! display, served over the tailnet at its own resolution. Everything else — the
+//! private display, the portal, the automation, the teardown — is shared.
+//!
 //! Everything it starts, it stops: the portal, the display forwarding and the X
 //! server are all torn down on the way out, whether the reader quits or the
 //! window closes.
@@ -30,7 +34,7 @@ use nix::sys::termios::{self, SetArg, Termios};
 use crate::termview::{self, Action, Cell, Frame, Key, Viewport};
 use crate::xscreen::XScreen;
 use crate::xvfb::Xvfb;
-use crate::{display, ops};
+use crate::{display, ops, webview};
 
 /// How the reader asked for the session to look.
 pub struct Options {
@@ -49,6 +53,10 @@ pub struct Options {
     /// Authenticator prompt and there is no field to fill. Measured on this tenant —
     /// typing an address at that point reaches nothing at all.
     pub credentials: Option<Credentials>,
+    /// Serve the window to a browser instead of drawing it in this terminal. The
+    /// display, the portal and the teardown are the same either way — only the
+    /// viewer changes.
+    pub web: Option<webview::Options>,
 }
 
 impl Default for Options {
@@ -62,6 +70,7 @@ impl Default for Options {
             display: None,
             automatic: true,
             credentials: None,
+            web: None,
         }
     }
 }
@@ -104,9 +113,14 @@ const PORTAL_POLL: Duration = Duration::from_secs(3);
 
 /// Run the whole sign-in session.
 pub fn run(options: Options) -> Result<()> {
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+    // Only the terminal viewer needs a terminal. `--web` draws nowhere near this
+    // tty, so it stays usable from a script, a systemd unit or a pipe.
+    if options.web.is_none()
+        && (!std::io::stdin().is_terminal() || !std::io::stdout().is_terminal())
+    {
         anyhow::bail!(
-            "login needs a terminal on both stdin and stdout — run it directly, not through a pipe"
+            "login needs a terminal on both stdin and stdout — run it directly, not through a pipe, \
+             or serve the window to a browser with --web"
         );
     }
 
@@ -135,11 +149,13 @@ pub fn run(options: Options) -> Result<()> {
     if options.automatic {
         automate(&screen, options.credentials.as_ref())?;
     }
-    print_keys(&display_name);
-
-    let outcome = {
-        let tty = RawTty::enter()?;
-        view(&screen, &tty)
+    let outcome = match &options.web {
+        Some(web) => webview::serve(&screen, web),
+        None => {
+            print_keys(&display_name);
+            let tty = RawTty::enter()?;
+            view(&screen, &tty)
+        }
     };
 
     // The tty is restored here, so everything below prints normally.
@@ -395,11 +411,22 @@ fn catch_hangups() {
     }
 }
 
-/// What the viewer ended on.
-struct Session {
+/// What the viewer ended on. Either viewer — the terminal one below, or the
+/// browser one in [`crate::webview`] — reports the session the same way, so the
+/// teardown in [`run`] is written once.
+pub struct Session {
     /// True when the portal exited by itself (the reader closed the window),
     /// false when the reader quit the viewer with the window still open.
-    portal_gone: bool,
+    pub portal_gone: bool,
+}
+
+/// Has the session been cut from outside (a dropped SSH connection, Ctrl+C)?
+///
+/// Both viewers poll this rather than dying in the signal handler, so the ordinary
+/// teardown runs: the portal is closed, the container goes back to headless and the
+/// X server is stopped.
+pub fn interrupted() -> bool {
+    INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Draw the display and forward input until the reader quits or the window goes.
@@ -408,11 +435,9 @@ fn view(screen: &XScreen, tty: &RawTty) -> Result<Session> {
     // Fit the WINDOW, not the desktop it sits on. The dialog is a third of the
     // screen, so fitting the screen shrank it past reading.
     let mut viewport = match screen.capture() {
-        Ok(frame) => Viewport::at_actual_size(
-            termview::content_bounds(&frame),
-            cols,
-            picture_rows(rows),
-        ),
+        Ok(frame) => {
+            Viewport::at_actual_size(termview::content_bounds(&frame), cols, picture_rows(rows))
+        }
         Err(_) => Viewport::fitted(screen.width, screen.height, cols, picture_rows(rows)),
     };
     let mut previous: Option<Vec<Cell>> = None;
@@ -551,7 +576,6 @@ fn view(screen: &XScreen, tty: &RawTty) -> Result<Session> {
             out.push_str(&status_line(&viewport, &frame, screen, cols, rows));
             tty.write(&out)?;
         }
-
     }
 }
 
@@ -753,7 +777,10 @@ mod tests {
         let line = status_text(right, 80);
         assert!(line.ends_with(right), "the state was truncated: {line:?}");
         assert!(line.contains("  "), "no gap between the halves: {line:?}");
-        assert!(!line.contains("quit1:"), "the halves still collide: {line:?}");
+        assert!(
+            !line.contains("quit1:"),
+            "the halves still collide: {line:?}"
+        );
         // Narrower than the state alone: the state wins and nothing panics.
         let line = status_text(right, 12);
         assert_eq!(line.chars().count(), 12);
