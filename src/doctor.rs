@@ -2,8 +2,13 @@
 //!
 //! Focused on the signals that can fail silently and that the user cares about:
 //! enrollment/registration drift, the container being up, network reach, the
-//! identity broker, the keyring, and the compliance agent. Cosmetic facts
-//! (display mode, SSO, host) are surfaced elsewhere in the UI, not here.
+//! identity broker, its virtual display, the keyring, the locks it can leave
+//! behind, and the compliance agent. Cosmetic facts (display mode, SSO, host) are
+//! surfaced elsewhere in the UI, not here.
+//!
+//! Four of those checks describe one symptom — the broker answers no account, so
+//! the device reads as signed out — with four different causes. Keep them
+//! separate: the fix for each is different, and only one of them is the keyring.
 //!
 //! [`collect`] returns the checks as structured data (used by the GUI); [`run`]
 //! prints them as status lines (used by the CLI).
@@ -15,6 +20,7 @@ use serde::Serialize;
 
 use crate::backend;
 use crate::config::Config;
+use crate::provision;
 
 #[derive(Clone, Copy, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -127,6 +133,20 @@ pub fn collect() -> Vec<Check> {
         checks.push(Check::new(Status::Warn, "Identity broker", "not active"));
     }
 
+    // The virtual display, headless only. The broker is a GTK app: with no :99 it
+    // exits at activation, and every token call then answers `NoReply` — which
+    // reads exactly like a locked keyring, two lines below.
+    if !config.display_forwarding {
+        match backend::probe(&config, "[ -S /tmp/.X11-unix/X99 ]") {
+            0 => checks.push(Check::new(Status::Ok, "Virtual display", ":99 running")),
+            _ => checks.push(Check::new(
+                Status::Fail,
+                "Virtual display",
+                ":99 is down — the broker exits at activation; restart the container",
+            )),
+        }
+    }
+
     // Keyring unlocked (holds the device key; locked → broker can't store secrets).
     let keyring_unlocked = "export XDG_RUNTIME_DIR=/run/user/0 \
          DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus; \
@@ -136,6 +156,21 @@ pub fn collect() -> Vec<Check> {
     match backend::probe(&config, keyring_unlocked) {
         0 => checks.push(Check::new(Status::Ok, "Keyring", "unlocked")),
         _ => checks.push(Check::new(Status::Skip, "Keyring", "locked or unknown")),
+    }
+
+    // Stale broker locks. Nothing else in this list reports them: they live in
+    // `/dev/shm`, which the host shares with the container, so they outlive every
+    // restart. One of them makes each token call block for 15 seconds and answer
+    // with an empty account list, so the device reads as signed out.
+    let no_stale_locks = format!("{}\nexit 0", provision::stale_broker_locks_script("exit 1"));
+    match backend::probe(&config, &no_stale_locks) {
+        0 => checks.push(Check::new(Status::Ok, "Broker locks", "none held")),
+        _ => checks.push(Check::new(
+            Status::Fail,
+            "Broker locks",
+            "a killed broker left a lock in /dev/shm — token calls answer with no \
+             account; restart the container to clear it",
+        )),
     }
 
     // Compliance agent: the timer must be scheduled (not masked/stopped), or the
