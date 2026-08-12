@@ -720,7 +720,10 @@ mod tests {
     #[test]
     fn the_portal_puts_the_broker_back_on_the_container_display() {
         let script = crate::provision::BROKER_DISPLAY_SCRIPT;
-        assert!(script.contains("DISPLAY=:99"), "the container's own display");
+        assert!(
+            script.contains("DISPLAY=:99"),
+            "the container's own display"
+        );
         assert!(
             script.contains("dbus-update-activation-environment"),
             "publishing it is what the broker inherits"

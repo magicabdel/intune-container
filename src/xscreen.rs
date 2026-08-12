@@ -195,7 +195,7 @@ impl XScreen {
     }
 
     fn decode(&self, data: &[u8]) -> Frame {
-        let bytes = (self.bits_per_pixel as usize + 7) / 8;
+        let bytes = (self.bits_per_pixel as usize).div_ceil(8);
         let mut rgb = Vec::with_capacity((self.width * self.height * 3) as usize);
         for y in 0..self.height as usize {
             for x in 0..self.width as usize {
@@ -281,7 +281,9 @@ impl XScreen {
             let Ok(cookie) = self.conn.get_geometry(child) else {
                 continue;
             };
-            let Ok(geometry) = cookie.reply() else { continue };
+            let Ok(geometry) = cookie.reply() else {
+                continue;
+            };
             if geometry.width >= 80 && geometry.height >= 40 {
                 return Ok(Some(child));
             }
@@ -474,7 +476,10 @@ mod tests {
                 }
             }
         }
-        assert!(seen_white, "the window never appeared, or the pixel format is wrong");
+        assert!(
+            seen_white,
+            "the window never appeared, or the pixel format is wrong"
+        );
 
         screen.place_and_focus().expect("focus");
         for c in format!("touch {proof}").chars() {

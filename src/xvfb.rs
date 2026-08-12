@@ -29,7 +29,7 @@ impl Xvfb {
     pub fn start(width: u32, height: u32, number: Option<u32>) -> Result<Self> {
         let number = match number {
             Some(n) => n,
-            None => first_free_display(|n| display_taken(n))
+            None => first_free_display(display_taken)
                 .context("no free X display number between :77 and :99")?,
         };
         // Xvfb's own diagnostics go to a file rather than to /dev/null: "Server is

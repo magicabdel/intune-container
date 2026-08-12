@@ -249,10 +249,7 @@ impl Viewport {
 
     /// How many source pixels the terminal covers at this scale.
     pub fn covered(&self, cols: u16, rows: u16) -> (f32, f32) {
-        (
-            cols as f32 * self.scale,
-            rows as f32 * 2.0 * self.scale,
-        )
+        (cols as f32 * self.scale, rows as f32 * 2.0 * self.scale)
     }
 
     /// Keep the view over the frame: no scrolling into the void, and a view
@@ -421,7 +418,11 @@ pub enum Action {
     /// Send a named key.
     Press(Key),
     /// Left button at a terminal cell (`down` false is the release).
-    Click { col: u16, row: u16, down: bool },
+    Click {
+        col: u16,
+        row: u16,
+        down: bool,
+    },
     ZoomIn,
     ZoomOut,
     Fit,
@@ -642,7 +643,10 @@ fn decode_mouse(buf: &[u8]) -> Escape {
 pub const HELP: &[(&str, &str)] = &[
     ("type / Enter / Tab", "goes to the sign-in page"),
     ("click", "moves and clicks the pointer there"),
-    ("F2 / Ctrl+U", "zoom in — use it to read the Authenticator number"),
+    (
+        "F2 / Ctrl+U",
+        "zoom in — use it to read the Authenticator number",
+    ),
     ("F3 / Ctrl+D", "zoom out"),
     ("F4 / Ctrl+W", "fit the whole screen"),
     ("F6", "actual size (one pixel per half cell)"),
@@ -682,8 +686,14 @@ mod tests {
         // Within the scan's two-pixel step.
         assert!(found.x <= win.x && win.x - found.x <= 2, "{found:?}");
         assert!(found.y <= win.y && win.y - found.y <= 2, "{found:?}");
-        assert!(found.width >= win.width && found.width <= win.width + 4, "{found:?}");
-        assert!(found.height >= win.height && found.height <= win.height + 4, "{found:?}");
+        assert!(
+            found.width >= win.width && found.width <= win.width + 4,
+            "{found:?}"
+        );
+        assert!(
+            found.height >= win.height && found.height <= win.height + 4,
+            "{found:?}"
+        );
     }
 
     #[test]
@@ -842,7 +852,10 @@ mod tests {
         let out = paint(Some(&a), &b, cols, rows);
         // One cell means one block character, and no other.
         assert_eq!(out.matches(BLOCK).count(), 1);
-        assert!(out.contains("\x1b[2;2H"), "did not address row 2 col 2: {out:?}");
+        assert!(
+            out.contains("\x1b[2;2H"),
+            "did not address row 2 col 2: {out:?}"
+        );
         assert!(out.contains("38;2;1;2;3"));
     }
 
