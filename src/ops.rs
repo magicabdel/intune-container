@@ -78,21 +78,35 @@ fn locked_ensure_running(config: &mut config::Config, with_display: bool) -> Res
 ///
 /// Callers must hold the lifecycle lock (use [`locked_ensure_running`]).
 fn ensure_running(config: &mut config::Config, with_display: bool) -> Result<()> {
+    ensure_running_on(config, with_display, &display::DisplayInfo::detect())
+}
+
+/// [`ensure_running`] against a display the caller names rather than the one this
+/// process inherited.
+///
+/// `login` needs this: its display is a private Xvfb it just created, so
+/// detection — which reads `$DISPLAY` — would find the user's session or nothing
+/// at all. Attaching binds the whole `/tmp/.X11-unix` directory, so a container
+/// that is *already* forwarding some display can reach the new socket without a
+/// restart; that is why this does not force one.
+fn ensure_running_on(
+    config: &mut config::Config,
+    with_display: bool,
+    display: &display::DisplayInfo,
+) -> Result<()> {
     if !config.initialized {
         anyhow::bail!("Not set up yet. Run:  intune-container enroll");
     }
 
-    let display = display::DisplayInfo::detect();
-
     if backend::is_running(config) {
         if with_display && !config.display_forwarding {
-            backend::attach_display(config, &display)?;
+            backend::attach_display(config, display)?;
         }
         return Ok(());
     }
 
     debug!("Container not running — starting it...");
-    boot(config, &display, with_display)?;
+    boot(config, display, with_display)?;
     Ok(())
 }
 
@@ -163,6 +177,76 @@ pub fn enroll() -> Result<bool> {
     }
 
     Ok(closed)
+}
+
+// ===== Login (terminal sign-in) =====
+
+/// Bring the container up with `display` attached and launch the Intune portal on
+/// it, in the background.
+///
+/// The three halves of a terminal sign-in are split so [`crate::login`] can drive
+/// the window between them: this starts it, [`portal_is_running`] says whether it
+/// is still there, and [`portal_finish`] puts the container back the way it was.
+/// `enroll` does the same three things in one call because it has a real screen
+/// to wait on.
+pub fn portal_start(display: &display::DisplayInfo) -> Result<()> {
+    let mut config =
+        config::Config::load().context("Not set up yet. Run:  intune-container enroll")?;
+    {
+        let _lock = lock::LifecycleLock::acquire()?;
+        ensure_running_on(&mut config, true, display)?;
+    }
+
+    // Gate on the container's own services, exactly as enrollment does: a portal
+    // started before the broker is up dies with "Message recipient disconnected".
+    backend::wait_until_portal_ready(&config);
+
+    info!("Starting the Intune portal — its window can take up to ~30s the first time.");
+    backend::exec(&config, "intune-portal", None, display)?;
+
+    // Take the broker off our display and put it back on the container's own.
+    //
+    // The portal is launched through a login shell, and the session profile
+    // publishes whatever DISPLAY it is given into the D-Bus activation
+    // environment — so without this the BROKER inherits the private display this
+    // command created, and dies with `cannot open display` the moment the command
+    // ends. That is not a small bug: every token call then fails, the app reports a
+    // broken sign-in, and the automatic repair restarts the container against a
+    // cause a restart cannot fix.
+    //
+    // The portal keeps its own DISPLAY (it was given one in its environment); only
+    // what the broker inherits is changed back.
+    backend::probe(&config, crate::provision::BROKER_DISPLAY_SCRIPT);
+    Ok(())
+}
+
+/// Whether the portal window is still open. False also when the container is not
+/// running at all, which is the same thing from the viewer's point of view.
+pub fn portal_is_running() -> bool {
+    let Ok(config) = config::Config::load() else {
+        return false;
+    };
+    backend::probe(
+        &config,
+        "pgrep -u \"$(id -u)\" -x intune-portal >/dev/null 2>&1",
+    ) == 0
+}
+
+/// Close the portal window. Used when the reader quits the viewer with the window
+/// still open: the display is about to be destroyed, and a portal drawing into a
+/// display that no longer exists is a process nobody can reach.
+pub fn portal_stop() -> Result<()> {
+    let config = config::Config::load().context("Failed to load configuration")?;
+    // TERM, never KILL: the portal writes the broker's account state on the way
+    // out, and half-written state is worse than a window left open.
+    backend::probe(&config, "pkill -u \"$(id -u)\" -x intune-portal");
+    Ok(())
+}
+
+/// Return the container to headless isolation after a terminal sign-in.
+pub fn portal_finish() -> Result<()> {
+    let mut config = config::Config::load().context("Failed to load configuration")?;
+    auto_detach_after_gui(&mut config)
 }
 
 // ===== Edge =====
@@ -704,4 +788,42 @@ fn remove_browser_sso_integration(home: &str) {
         let _ = std::fs::remove_file(format!("{dir}/linux_entra_sso.json"));
     }
     let _ = std::fs::remove_dir_all(format!("{home}/.local/lib/intune-container"));
+}
+
+#[cfg(test)]
+mod tests {
+    /// The one thing a terminal sign-in must never leave behind: the broker
+    /// pointing at the private display the command created.
+    ///
+    /// It is checked on the SCRIPT rather than on a live container, because the
+    /// failure is silent — the sign-in works, the command exits, and the account
+    /// breaks minutes later with an error that names a keyring.
+    #[test]
+    fn the_portal_puts_the_broker_back_on_the_container_display() {
+        let script = crate::provision::BROKER_DISPLAY_SCRIPT;
+        assert!(
+            script.contains("DISPLAY=:99"),
+            "the container's own display"
+        );
+        assert!(
+            script.contains("dbus-update-activation-environment"),
+            "publishing it is what the broker inherits"
+        );
+        // And it starts that display rather than assuming it: a container booted
+        // with a host display forwarded has no :99 running. It starts it as the
+        // supervised unit, so a sign-in leaves the same display the boot would.
+        assert!(script.contains(":99 -screen 0"));
+        assert!(script.contains("systemd-run --user --unit=intune-xvfb"));
+
+        let source = include_str!("ops.rs");
+        let start = source
+            .split("pub fn portal_start")
+            .nth(1)
+            .expect("portal_start exists");
+        let body = start.split("\n}\n").next().unwrap_or(start);
+        assert!(
+            body.contains("BROKER_DISPLAY_SCRIPT"),
+            "portal_start must restore the broker's display before it returns"
+        );
+    }
 }

@@ -64,6 +64,54 @@ intune-container start    # (optional) run headless + seamless Teams/M365 SSO
 Daily CLI use: `edge` · `status` · `update` · `doctor` · `stop`. Full walkthrough
 in the **[Quickstart](docs/quickstart.md)**.
 
+### No screen at all? Sign in from the terminal
+
+On a headless box — an EC2 instance, a build machine — there is no display to put
+the sign-in window on, and the Primary Refresh Token still expires: Entra then
+answers `interaction_required` and every token call fails until a human signs in
+again. `login` does that over SSH, with no VNC and no compositor:
+
+```sh
+intune-container login             # the sign-in window, drawn in your terminal
+```
+
+It starts a private invisible display, runs the portal on it, draws that display
+with half-block characters and sends your keys and clicks back. Type your address
+and password where you are; when the two-digit Authenticator number appears, press
+**F2** to zoom in and read it. **F1** lists the keys, **F4** fits the whole window,
+**Ctrl+arrows** pan, **Ctrl+Q** leaves.
+
+It needs `Xvfb` on the host (`sudo apt install xvfb`) and a terminal with 24-bit
+colour. Everything it starts — the portal, the display forwarding, the X server —
+it stops again, including when your SSH connection drops.
+
+#### Or in a browser, over your tailnet
+
+Half-block cells cost half the vertical resolution, and 13-pixel text survives that
+only when you zoom. `--web` serves the same window to a browser instead, at its own
+size and with a real pointer:
+
+```sh
+intune-container login --web       # prints one link, with a token for this session
+```
+
+It listens on this host's **tailnet** address, so any device in your tailnet can
+open it — your phone included, which is where the Authenticator prompt arrives. With
+no Tailscale on the host it binds loopback instead and prints the `ssh -L` line for
+it. `--bind` and `--port` override both. Every request must carry the token from the
+link; nothing else is served.
+
+The page is one file with no build step: a canvas, the tiles that changed since the
+last frame (gzipped, so the browser inflates them), and your keys and clicks posted
+back. **Ctrl+V** pastes — a password from your manager is typed into the display one
+key at a time. **Finish** closes the window and ends the session, as **Ctrl+Q** does
+in the terminal viewer.
+
+Why not a plain text prompt? Because the identity broker allows none: it refuses a
+device-code flow on Linux (`AcquireTokenWithDeviceCodeFlow is not implemented on
+Linux platform`) and renders the sign-in itself, in an embedded WebKitGTK view on
+an X display. The window has to exist — this brings it to the terminal.
+
 The default container image is publicly hosted and ready to go (it already
 includes everything for headless SSO) — there's nothing to build, and no
 container engine is needed: the image is pulled with a built-in OCI client. Each
@@ -127,6 +175,12 @@ shells out, and neither needs elevated privilege.
 - [x] **Compositor-agnostic** — auto-detects Wayland, abstract X11, and
   Xauthority; no hardcoded socket names.
 - [x] **One-command enroll** — provision, boot, and open the portal in one step.
+- [x] **Terminal sign-in** (`login`) — for a host with no screen: the portal runs
+  on a private invisible display and is drawn in the terminal, keys and clicks
+  included. No VNC server, no compositor, no X forwarding.
+- [x] **Browser sign-in over the tailnet** (`login --web`) — the same private
+  display, served to any device in your tailnet at full resolution, behind a
+  per-session token. One built-in HTTP server, no WebSocket and no VNC.
 - [x] **Enrollment backup/restore** — survive container rebuilds without
   re-enrolling.
 - [x] **Microsoft Edge** in the container, with display/GPU passthrough during

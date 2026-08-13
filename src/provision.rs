@@ -156,27 +156,24 @@ done"#,
     )
 }
 
-/// The shell script the running container's root runs (via `setns`) once per
-/// boot to recreate the session a PAM login would, so Intune works end to end:
-/// the per-user systemd manager (for `XDG_RUNTIME_DIR` + D-Bus session bus),
-/// an unlocked gnome-keyring with a created `login` collection, the Intune
-/// **compliance agent timer** (without it the device never reports compliant),
-/// no stale broker lock left in `/dev/shm`, and a broker restart so it re-reads
-/// the keyring. Mirrors the nspawn session.
+/// Start the container's own private display and publish it to the D-Bus
+/// activation environment, so the on-demand identity broker inherits a display
+/// that exists.
 ///
-/// The display and the keyring daemon run as **transient user units**, never as
-/// bare background processes. The `setns` exec that runs this script is torn down
-/// with its cgroup, and every child of it dies at that moment — minutes after a
-/// boot that reported success.
-pub fn runtime_setup_script(user: &ContainerUser, headless: bool) -> String {
-    // Headless (background SSO): the identity broker is a GTK app that exits
-    // without a display, so start a private Xvfb and publish DISPLAY into the
-    // user D-Bus activation environment (where the on-demand broker inherits it).
-    // `Restart=always` matters as much as the unit does: a dead :99 makes the
-    // broker exit at activation, and every token call then answers `NoReply` —
-    // which reads exactly like a locked keyring.
-    let display_block = if headless {
-        r#"_xvfb=$(command -v Xvfb 2>/dev/null)
+/// The broker is a GTK program: with no reachable `DISPLAY` it exits at activation
+/// and every token call answers `NoReply`, which reads exactly like a locked
+/// keyring. It has to be a display the CONTAINER owns, and that is the whole point
+/// of `:99` — a forwarded host display works while the app using it is up, and
+/// leaves the broker pointing at nothing the moment it goes. That happened: a
+/// `login` session published its private Xvfb here through the login-shell profile,
+/// was killed, and the broker then failed with `cannot open display: :77` until
+/// somebody read the container's own journal.
+///
+/// It runs as a transient user unit with `Restart=always` rather than as a bare
+/// background process, because a child of the `setns` exec dies with that exec's
+/// cgroup. Run a second time — which is what a sign-in does on its way out —
+/// `is-active` makes the unit a no-op and only the environment is published again.
+pub const BROKER_DISPLAY_SCRIPT: &str = r#"_xvfb=$(command -v Xvfb 2>/dev/null)
 if [ -n "$_xvfb" ]; then
     if ! systemctl --user is-active --quiet intune-xvfb.service 2>/dev/null; then
         systemctl --user reset-failed intune-xvfb.service >/dev/null 2>&1 || true
@@ -191,10 +188,27 @@ if [ -n "$_xvfb" ]; then
     systemctl --user import-environment DISPLAY GDK_BACKEND >/dev/null 2>&1 || true
     dbus-update-activation-environment --systemd DISPLAY GDK_BACKEND >/dev/null 2>&1 || true
 fi
-"#
-    } else {
-        ""
-    };
+"#;
+
+/// The shell script the running container's root runs (via `setns`) once per
+/// boot to recreate the session a PAM login would, so Intune works end to end:
+/// the per-user systemd manager (for `XDG_RUNTIME_DIR` + D-Bus session bus),
+/// an unlocked gnome-keyring with a created `login` collection, the Intune
+/// **compliance agent timer** (without it the device never reports compliant),
+/// no stale broker lock left in `/dev/shm`, and a broker restart so it re-reads
+/// the keyring. Mirrors the nspawn session.
+///
+/// The display and the keyring daemon run as **transient user units**, never as
+/// bare background processes. The `setns` exec that runs this script is torn down
+/// with its cgroup, and every child of it dies at that moment — minutes after a
+/// boot that reported success.
+pub fn runtime_setup_script(user: &ContainerUser, headless: bool) -> String {
+    // Headless (background SSO): the identity broker is a GTK app that exits
+    // without a display, so start the container's own and publish DISPLAY into the
+    // user D-Bus activation environment, where the on-demand broker inherits it.
+    // The block is a const because the two sign-in viewers run it again on their
+    // way out, to take the broker off the private display they created.
+    let display_block = if headless { BROKER_DISPLAY_SCRIPT } else { "" };
     format!(
         r#"# Wait for the system to finish booting (logind + system bus).
 for _ in $(seq 1 90); do
