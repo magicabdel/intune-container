@@ -266,6 +266,21 @@ impl Server<'_> {
             return respond(stream, "204 No Content", "text/plain", &[], b"");
         }
         if !constant_time_eq(request.token.as_bytes(), self.token.as_bytes()) {
+            // A refused page load is almost always a link from an earlier session:
+            // the token is in the URL, so the browser keeps the old one in its
+            // history and offers it back in the address bar. That reader gets a
+            // page that says so. The paths the page itself calls keep the plain
+            // body, because the script reads the status and never the text.
+            if request.method == "GET" && request.path == "/" {
+                let page = refused_page();
+                return respond(
+                    stream,
+                    "403 Forbidden",
+                    "text/html; charset=utf-8",
+                    &[],
+                    page.as_bytes(),
+                );
+            }
             return respond(stream, "403 Forbidden", "text/plain", &[], b"wrong token\n");
         }
         match (request.method.as_str(), request.path.as_str()) {
@@ -689,10 +704,16 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+/// The token's width in bytes, and the same width in the hex the link carries. The
+/// refused page names the count, because a truncated copy is one of the two ways a
+/// reader arrives at it.
+const TOKEN_BYTES: usize = 16;
+const TOKEN_HEX: usize = TOKEN_BYTES * 2;
+
 /// A fresh 128-bit session token, from the kernel rather than from a clock: it is
 /// the only thing between the tailnet and a password being typed.
 fn new_token() -> Result<String> {
-    let mut bytes = [0u8; 16];
+    let mut bytes = [0u8; TOKEN_BYTES];
     std::fs::File::open("/dev/urandom")
         .and_then(|mut f| f.read_exact(&mut bytes))
         .context("cannot read /dev/urandom for a session token")?;
@@ -744,8 +765,55 @@ fn print_url(options: &Options, token: &str) {
     }
     eprintln!();
     eprintln!("The link holds a token that is new for this session. Anything without it is");
-    eprintln!("refused. Press Ctrl+C here, or Finish in the page, to close the window.");
+    eprintln!("refused, and that includes the link from an earlier sign-in: paste this one");
+    eprintln!("whole, rather than letting the address bar complete an older one.");
+    eprintln!("Press Ctrl+C here, or Finish in the page, to close the window.");
     eprintln!();
+}
+
+/// The answer to a page load that carries no token, or one from a session that has
+/// ended.
+///
+/// A bare `wrong token` is true and useless: the reader cannot tell it from a
+/// broken viewer, and the thing they have to do — take the link this run printed —
+/// is not in it. The port is open to whoever reads this, so the page says nothing
+/// that the open port does not already say.
+fn refused_page() -> String {
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Intune sign-in — the link is not for this session</title>
+<style>
+  html, body {{ margin: 0; height: 100%; background: #12151a; color: #d7dae0;
+    font: 15px/1.6 ui-sans-serif, system-ui, sans-serif; }}
+  body {{ display: grid; place-items: center; padding: 24px; box-sizing: border-box; }}
+  main {{ max-width: 34em; }}
+  h1 {{ font-size: 19px; margin: 0 0 12px; }}
+  p {{ margin: 0 0 12px; color: #9aa1ad; }}
+  code {{ background: #1b1f26; border: 1px solid #2a2f37; border-radius: 4px;
+    padding: 1px 5px; color: #d7dae0; }}
+</style>
+</head>
+<body>
+<main>
+<h1>This link is not for the session that is running.</h1>
+<p>The viewer mints a token for every <code>login --web</code>, and it refuses a
+request that carries another one. A link from an earlier sign-in stops working when
+that sign-in ends.</p>
+<p>Go to the terminal that runs <code>login --web</code>. It printed one link for
+this session. The address is the one you are on; only the {hex} characters after
+<code>?k=</code> are different. Paste that link whole.</p>
+<p>The address bar completes an older link from the history, so paste the new one
+rather than accepting the completion.</p>
+</main>
+</body>
+</html>
+"#,
+        hex = TOKEN_HEX,
+    )
 }
 
 /// The page: a canvas, a poll loop, and the keyboard and mouse sent back.
@@ -1063,10 +1131,32 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_page_load_says_what_to_do_about_it() {
+        let page = refused_page();
+        // The reader has to learn three things: the link is old, a new one exists,
+        // and the terminal holds it. A body that named none of them would leave
+        // them where `wrong token` did.
+        assert!(page.contains("<!DOCTYPE html>"));
+        assert!(page.contains("login --web"), "the page names no command");
+        assert!(
+            page.contains("?k="),
+            "the page does not show the link's shape"
+        );
+        assert!(
+            page.contains(&TOKEN_HEX.to_string()),
+            "the page does not say how long the token is"
+        );
+        assert!(
+            !page.contains("wrong token"),
+            "the page still holds the message it replaces"
+        );
+    }
+
+    #[test]
     fn a_session_token_is_new_every_time() {
         let one = new_token().expect("a token");
         let two = new_token().expect("a token");
-        assert_eq!(one.len(), 32);
+        assert_eq!(one.len(), TOKEN_HEX);
         assert!(one.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(one, two);
     }
@@ -1269,10 +1359,28 @@ mod tests {
 
             // A request with the wrong token, and one with none, must both be
             // refused before anything of the display is sent.
-            let (status, _) = get("/delta?seq=0", "not-the-token");
+            let (status, body) = get("/delta?seq=0", "not-the-token");
             assert_eq!(status, 403, "a wrong token was served");
+            assert_eq!(
+                body, b"wrong token\n",
+                "the script's own path got a page instead of a body"
+            );
             let (status, _) = get("/delta?seq=0", "");
             assert_eq!(status, 403, "a missing token was served");
+
+            // A page load with a stale token is the one refusal a person reads, so
+            // it answers with the page rather than with the two words.
+            let (status, stale) = get("/", "a-link-from-an-older-session");
+            assert_eq!(status, 403, "a stale link was served the display");
+            let stale = String::from_utf8_lossy(&stale);
+            assert!(
+                stale.contains("<!DOCTYPE html>"),
+                "a stale link got no page"
+            );
+            assert!(
+                stale.contains("login --web"),
+                "the refusal does not say where the new link is"
+            );
             // The browser asks for this one by itself, with no token to give.
             let (status, _) = get("/favicon.ico", "");
             assert_eq!(status, 204, "the favicon left an error in the console");
