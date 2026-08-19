@@ -23,7 +23,7 @@ use x11rb::protocol::xproto::{
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
 
-use crate::termview::{Frame, Key};
+use crate::termview::{Bounds, Frame, Key};
 
 /// X11 event types, as XTEST's `fake_input` wants them.
 const KEY_PRESS: u8 = 2;
@@ -258,6 +258,93 @@ impl XScreen {
     /// would look broken for that whole time.
     pub fn has_window(&self) -> bool {
         matches!(self.topmost(), Ok(Some(_)))
+    }
+
+    /// The box that holds every real window on the display, or `None` when there
+    /// is none.
+    ///
+    /// The browser viewer streams this box rather than the whole display. A portal
+    /// window is 478×628 on a 1280×800 screen, so two thirds of what it would
+    /// otherwise send is desktop that nobody put anything on — and a reader who
+    /// opens the page sees mostly black and reasonably concludes it is broken.
+    ///
+    /// It is the union and not the topmost window, because the identity broker
+    /// opens its Authentication dialog beside the portal rather than over it: a box
+    /// around one of them would cut the other in half.
+    ///
+    /// Read from the X geometry rather than from the pixels. The terminal viewer
+    /// finds its box by scanning for anything brighter than the desktop
+    /// ([`crate::termview::content_bounds`]), which is right for a half-block
+    /// picture but would crop a dark-themed window to the part of it that happens
+    /// to be light.
+    pub fn window_bounds(&self) -> Result<Option<Bounds>> {
+        let mut box_: Option<Bounds> = None;
+        for window in self.real_windows()? {
+            let Ok(Ok(geometry)) = self.conn.get_geometry(window).map(|c| c.reply()) else {
+                continue;
+            };
+            // A window may hang off the edge of the display; the box may not.
+            let x = geometry.x.max(0) as u32;
+            let y = geometry.y.max(0) as u32;
+            let right = (x + geometry.width as u32).min(self.width);
+            let bottom = (y + geometry.height as u32).min(self.height);
+            if right <= x || bottom <= y {
+                continue;
+            }
+            box_ = Some(match box_ {
+                None => Bounds {
+                    x,
+                    y,
+                    width: right - x,
+                    height: bottom - y,
+                },
+                Some(so_far) => {
+                    let x0 = so_far.x.min(x);
+                    let y0 = so_far.y.min(y);
+                    let x1 = (so_far.x + so_far.width).max(right);
+                    let y1 = (so_far.y + so_far.height).max(bottom);
+                    Bounds {
+                        x: x0,
+                        y: y0,
+                        width: x1 - x0,
+                        height: y1 - y0,
+                    }
+                }
+            });
+        }
+        Ok(box_)
+    }
+
+    /// Every mapped child of the root that is big enough to be a real window,
+    /// topmost first. Tooltips and the 1×1 helper windows GTK creates are skipped.
+    fn real_windows(&self) -> Result<Vec<Window>> {
+        let tree = self
+            .conn
+            .query_tree(self.root)
+            .context("cannot ask the X server for the window tree")?
+            .reply()
+            .context("the X server refused the window tree")?;
+        let mut windows = Vec::new();
+        // `children` is in bottom-to-top stacking order.
+        for &child in tree.children.iter().rev() {
+            let Ok(cookie) = self.conn.get_window_attributes(child) else {
+                continue;
+            };
+            let Ok(attrs) = cookie.reply() else { continue };
+            if attrs.map_state != MapState::VIEWABLE {
+                continue;
+            }
+            let Ok(cookie) = self.conn.get_geometry(child) else {
+                continue;
+            };
+            let Ok(geometry) = cookie.reply() else {
+                continue;
+            };
+            if geometry.width >= 80 && geometry.height >= 40 {
+                windows.push(child);
+            }
+        }
+        Ok(windows)
     }
 
     /// The topmost mapped child of the root that is big enough to be a real
