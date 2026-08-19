@@ -21,7 +21,7 @@ use std::io::IsTerminal;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use intune_container::{autostart, config, doctor, login, ops, webview};
+use intune_container::{autostart, config, doctor, login, ops, screen, webview};
 
 #[derive(Parser)]
 #[command(
@@ -116,6 +116,27 @@ enum Command {
 
         /// Port the browser viewer listens on
         #[arg(long, value_name = "N", requires = "web")]
+        port: Option<u16>,
+    },
+    /// Share the container's screen in a browser: Intune opens, and you drive
+    /// every step yourself
+    Screen {
+        /// Size of the screen, when this command has to create one. A screen it
+        /// finds keeps the size it has.
+        #[arg(long, default_value = "1280x800", value_name = "WxH")]
+        geometry: String,
+
+        /// Use this X display number instead of the first free one
+        #[arg(long, value_name = "N")]
+        display: Option<u32>,
+
+        /// Address to serve on (default: the tailnet address, or 127.0.0.1 when
+        /// there is none)
+        #[arg(long, value_name = "ADDR")]
+        bind: Option<std::net::IpAddr>,
+
+        /// Port to serve on
+        #[arg(long, value_name = "N")]
         port: Option<u16>,
     },
     /// Stop the container
@@ -287,6 +308,12 @@ fn main() -> Result<()> {
             display,
             web.then(|| webview::Options::resolved(bind, port)),
         )?,
+        Command::Screen {
+            geometry,
+            display,
+            bind,
+            port,
+        } => cmd_screen(&geometry, display, bind, port)?,
         Command::Stop => ops::stop()?,
         Command::Update { check, force } => cmd_update(check, force)?,
         Command::Status => cmd_status()?,
@@ -499,6 +526,23 @@ fn cmd_login(
         automatic: !manual,
         credentials,
         web,
+    })
+}
+
+/// Share the container's screen. No credentials are asked for: this command drives
+/// nothing, so there is nothing to type them into.
+fn cmd_screen(
+    geometry: &str,
+    display: Option<u32>,
+    bind: Option<std::net::IpAddr>,
+    port: Option<u16>,
+) -> Result<()> {
+    let (width, height) = login::parse_geometry(geometry)?;
+    screen::run(screen::Options {
+        width,
+        height,
+        display,
+        web: webview::Options::resolved(bind, port),
     })
 }
 

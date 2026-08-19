@@ -112,6 +112,32 @@ device-code flow on Linux (`AcquireTokenWithDeviceCodeFlow is not implemented on
 Linux platform`) and renders the sign-in itself, in an embedded WebKitGTK view on
 an X display. The window has to exist — this brings it to the terminal.
 
+#### Or share the screen and drive Intune yourself
+
+`login` signs in *for* you: it presses Sign in, types the address and the password,
+and closes what it opened. When you would rather see Intune and do every step
+yourself, share the screen instead:
+
+```sh
+intune-container screen            # opens Intune, streams it, drives nothing
+```
+
+It starts the Intune portal so the first screen is there without a second command,
+then touches nothing: every window the container opens — the portal, the identity
+broker's Authentication dialog, an Edge window — appears as it is, and your keyboard
+and mouse go straight to it. `--bind`, `--port` and `--geometry` work as they do for
+`login --web`, and the link carries the same per-session token.
+
+It streams the box around the windows rather than the whole screen, so a 478×628
+portal fills the page instead of sitting in the corner of a black 1280×800 desktop.
+A screen with nothing on it yet says so on the picture.
+
+Run it twice and the second one shares the screen the first already opened, rather
+than making an empty one: `intune-portal` is a single instance, so a command that
+insisted on its own display would stream black pixels while the portal drew
+somewhere else. A share that finds a screen leaves it running when it closes — only
+a share that opened one closes it.
+
 The default container image is publicly hosted and ready to go (it already
 includes everything for headless SSO) — there's nothing to build, and no
 container engine is needed: the image is pulled with a built-in OCI client. Each
@@ -181,6 +207,9 @@ shells out, and neither needs elevated privilege.
 - [x] **Browser sign-in over the tailnet** (`login --web`) — the same private
   display, served to any device in your tailnet at full resolution, behind a
   per-session token. One built-in HTTP server, no WebSocket and no VNC.
+- [x] **Screen share** (`screen`) — Intune opened for you and streamed to a
+  browser, driving nothing: every window as it is, cropped to the windows, and a
+  second run shares the screen the first one opened.
 - [x] **Enrollment backup/restore** — survive container rebuilds without
   re-enrolling.
 - [x] **Microsoft Edge** in the container, with display/GPU passthrough during

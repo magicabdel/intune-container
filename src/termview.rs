@@ -42,6 +42,35 @@ impl Frame {
         Self { width, height, rgb }
     }
 
+    /// The part of the frame inside `box_`, clipped to what the frame holds.
+    ///
+    /// The browser viewer sends this rather than the whole display: the window is a
+    /// third of the screen it sits on, and the rest is desktop nobody drew on. It
+    /// costs a copy of the box, which is smaller than the frame it copies from.
+    pub fn crop(&self, box_: Bounds) -> Frame {
+        let x0 = box_.x.min(self.width);
+        let y0 = box_.y.min(self.height);
+        let width = box_.width.min(self.width - x0);
+        let height = box_.height.min(self.height - y0);
+        if width == 0 || height == 0 {
+            return Frame {
+                width: 0,
+                height: 0,
+                rgb: Vec::new(),
+            };
+        }
+        let mut rgb = Vec::with_capacity((width * height * 3) as usize);
+        for row in 0..height {
+            let start = (((y0 + row) * self.width + x0) * 3) as usize;
+            let len = (width * 3) as usize;
+            match self.rgb.get(start..start + len) {
+                Some(bytes) => rgb.extend_from_slice(bytes),
+                None => rgb.extend(std::iter::repeat_n(0u8, len)),
+            }
+        }
+        Frame { width, height, rgb }
+    }
+
     fn pixel(&self, x: u32, y: u32) -> [u8; 3] {
         if x >= self.width || y >= self.height {
             return [0, 0, 0];
@@ -694,6 +723,51 @@ mod tests {
             found.height >= win.height && found.height <= win.height + 4,
             "{found:?}"
         );
+    }
+
+    #[test]
+    fn a_crop_holds_the_pixels_of_its_box() {
+        // A 4×4 frame with one white pixel at 2,1. Cropping to the 2×2 box at 2,1
+        // has to put that pixel first and nothing else with it.
+        let mut frame = Frame::flat(4, 4, [0, 0, 0]);
+        // Row 1, column 2, three bytes per pixel.
+        let at = (4 + 2) * 3;
+        frame.rgb[at] = 255;
+        frame.rgb[at + 1] = 255;
+        frame.rgb[at + 2] = 255;
+        let cut = frame.crop(Bounds {
+            x: 2,
+            y: 1,
+            width: 2,
+            height: 2,
+        });
+        assert_eq!((cut.width, cut.height), (2, 2));
+        assert_eq!(cut.rgb.len(), 2 * 2 * 3);
+        assert_eq!(&cut.rgb[0..3], &[255, 255, 255]);
+        assert!(cut.rgb[3..].iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn a_crop_is_clipped_to_the_frame_it_cuts_from() {
+        // A window may hang off the edge of the display. Reading past the last row
+        // would take another window's pixels, or none at all.
+        let frame = Frame::flat(8, 8, [7, 7, 7]);
+        let cut = frame.crop(Bounds {
+            x: 6,
+            y: 6,
+            width: 100,
+            height: 100,
+        });
+        assert_eq!((cut.width, cut.height), (2, 2));
+        assert_eq!(cut.rgb.len(), 2 * 2 * 3);
+        // A box entirely outside is empty rather than a panic.
+        let none = frame.crop(Bounds {
+            x: 8,
+            y: 8,
+            width: 4,
+            height: 4,
+        });
+        assert_eq!((none.width, none.height), (0, 0));
     }
 
     #[test]
