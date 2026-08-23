@@ -36,6 +36,10 @@ pub mod xvfb;
 /// Serving that same display to a browser, over the tailnet (`login --web`).
 pub mod webview;
 
+/// Sharing the container's screen to a browser, with no sign-in driving
+/// (`screen`).
+pub mod screen;
+
 /// Pure-Rust OCI image pull + layer extraction (no docker/podman).
 pub mod oci;
 

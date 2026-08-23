@@ -27,11 +27,43 @@ impl Xvfb {
     /// Start an invisible display of `width × height`. `number` picks the display
     /// number; `None` takes the first free one.
     pub fn start(width: u32, height: u32, number: Option<u32>) -> Result<Self> {
-        let number = match number {
-            Some(n) => n,
-            None => first_free_display(display_taken)
-                .context("no free X display number between :77 and :99")?,
-        };
+        if let Some(number) = number {
+            // A number the reader named is used or reported, never quietly swapped
+            // for another: they picked it to reach it.
+            return Self::start_on(width, height, number);
+        }
+
+        // Picking a free number and starting a server on it are two steps, and
+        // between them another process can take the number: two screen shares can
+        // start in the same second, and the test suite starts two servers at once
+        // on purpose.
+        //
+        // The number itself says which failure this was, so no message is parsed:
+        // a display that is taken NOW, having been free a moment ago, was taken by
+        // somebody else, and the next number is worth trying. A failure that leaves
+        // the number free — Xvfb not installed, a refused geometry — is the
+        // reader's, and it is reported as it is rather than tried 22 more times.
+        let mut lost = Vec::new();
+        loop {
+            let number = first_free_display(|n| display_taken(n) || lost.contains(&n))
+                .with_context(|| {
+                    format!("no free X display number between :{FIRST_DISPLAY} and :{LAST_DISPLAY}")
+                })?;
+            match Self::start_on(width, height, number) {
+                Err(e) if display_taken(number) => {
+                    debug!(
+                        number,
+                        "another process took this display number first: {e:#}"
+                    );
+                    lost.push(number);
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// Start a server on one display number, with no search and no retry.
+    fn start_on(width: u32, height: u32, number: u32) -> Result<Self> {
         // Xvfb's own diagnostics go to a file rather than to /dev/null: "Server is
         // already active for display 77" is the difference between a bug in this
         // code and a display number that is genuinely taken.
@@ -83,12 +115,12 @@ impl Xvfb {
         let display = self.display();
         for _ in 0..100 {
             if let Ok(Some(status)) = self.child.try_wait() {
-                let said = std::fs::read_to_string(log_path).unwrap_or_default();
-                let said = said.trim();
+                let log = std::fs::read_to_string(log_path).unwrap_or_default();
+                let said = said_why(&log);
                 anyhow::bail!(
                     "Xvfb exited immediately ({status}){}{}",
                     if said.is_empty() { "" } else { ": " },
-                    said.lines().next().unwrap_or("")
+                    said
                 );
             }
             if x11rb::connect(Some(&display)).is_ok() {
@@ -120,17 +152,61 @@ impl Drop for Xvfb {
     }
 }
 
+/// The last display number this tool creates one on.
+///
+/// `:99` is deliberately outside it. The container's own compliance agent runs a
+/// display there, and its socket lands in the `/tmp/.X11-unix` that is bound in —
+/// so it looks like one of ours from the host, and a viewer that took it would
+/// stream a 640×480 agent instead of a sign-in.
+const LAST_DISPLAY: u32 = 98;
+
+/// Every display number this tool may have created, lowest first.
+///
+/// The screen share walks it to find a display that a portal is already drawing
+/// on, because starting a second, empty one is how a reader ends up streaming
+/// black pixels.
+pub fn private_displays() -> impl Iterator<Item = u32> {
+    FIRST_DISPLAY..=LAST_DISPLAY
+}
+
 /// Is a display number already in use? True when either the X socket or the lock
 /// file exists — the lock is what a display leaves behind when its server dies
 /// badly, and starting a second server on it fails.
-fn display_taken(number: u32) -> bool {
+pub fn display_taken(number: u32) -> bool {
     Path::new(&format!("/tmp/.X11-unix/X{number}")).exists()
         || Path::new(&format!("/tmp/.X{number}-lock")).exists()
 }
 
-/// The first free display number in `77..=99`, or `None`.
+/// The first free display number in this tool's range, or `None`.
 fn first_free_display(taken: impl Fn(u32) -> bool) -> Option<u32> {
-    (FIRST_DISPLAY..=99).find(|n| !taken(*n))
+    (FIRST_DISPLAY..=LAST_DISPLAY).find(|n| !taken(*n))
+}
+
+/// The line of Xvfb's output that says why it exited.
+///
+/// Not the first line: Xvfb opens with the xkbcomp keymap warnings, which are
+/// pages long on a current keyboard map and say nothing about the exit. The reason
+/// is on an error line after them — `(EE) Server is already active for display 77`
+/// — so that is what the message carries.
+fn said_why(log: &str) -> String {
+    // A bare `(EE)` is a separator and carries nothing, so a line is judged by what
+    // is left of it once the marker is off.
+    let said: Vec<(bool, &str)> = log
+        .lines()
+        .map(|line| {
+            let line = line.trim();
+            match line.strip_prefix("(EE)") {
+                Some(rest) => (true, rest.trim()),
+                None => (false, line),
+            }
+        })
+        .filter(|(_, text)| !text.is_empty())
+        .collect();
+    said.iter()
+        .find(|(marked, _)| *marked)
+        .or_else(|| said.first())
+        .map(|(_, text)| text.to_string())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -147,5 +223,46 @@ mod tests {
     fn a_full_range_is_reported_rather_than_guessed() {
         // Better a clear failure than a second server fighting for :77.
         assert_eq!(first_free_display(|_| true), None);
+    }
+
+    #[test]
+    fn the_reason_is_read_past_the_keymap_warnings() {
+        // Real output from a display number that was already taken. Reporting the
+        // first line here gives "The XKEYBOARD keymap compiler (xkbcomp) reports:",
+        // which sends the reader after a keyboard problem they do not have.
+        let log = "The XKEYBOARD keymap compiler (xkbcomp) reports:\n\
+                   > Warning:          Could not resolve keysym XF86CameraAccessEnable\n\
+                   > Warning:          Could not resolve keysym XF86NextElement\n\
+                   Errors from xkbcomp are not fatal to the X server\n\
+                   (EE) \n\
+                   (EE) Server is already active for display 77\n\
+                   \tIf this server is no longer running, remove /tmp/.X77-lock\n";
+        assert_eq!(said_why(log), "Server is already active for display 77");
+    }
+
+    #[test]
+    fn an_output_with_no_error_line_still_says_something() {
+        assert_eq!(said_why("Fatal server error:\n"), "Fatal server error:");
+        assert_eq!(said_why(""), "");
+        // A bare marker carries nothing, so it is not the line chosen.
+        assert_eq!(said_why("(EE)\nreal reason here"), "real reason here");
+    }
+
+    #[test]
+    fn a_lost_number_is_skipped_on_the_next_pass() {
+        // The search takes the next one rather than trying 77 for ever.
+        let lost = [77u32];
+        let found = first_free_display(|n| lost.contains(&n));
+        assert_eq!(found, Some(78));
+    }
+
+    #[test]
+    fn the_scan_stops_before_the_agents_display() {
+        // :99 is the container's compliance agent. A viewer that streamed it would
+        // show a 640×480 service, not a sign-in.
+        let numbers: Vec<u32> = private_displays().collect();
+        assert_eq!(numbers.first(), Some(&77));
+        assert_eq!(numbers.last(), Some(&98));
+        assert!(!numbers.contains(&99));
     }
 }

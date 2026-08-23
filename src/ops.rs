@@ -15,6 +15,7 @@
 //! the GUI can subscribe to it.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -240,7 +241,34 @@ pub fn portal_stop() -> Result<()> {
     // TERM, never KILL: the portal writes the broker's account state on the way
     // out, and half-written state is worse than a window left open.
     backend::probe(&config, "pkill -u \"$(id -u)\" -x intune-portal");
+    wait_for_portal_exit();
     Ok(())
+}
+
+/// How long to wait for a portal that was asked to close.
+const PORTAL_EXIT_WAIT: Duration = Duration::from_secs(10);
+
+/// Wait for the portal to go, and say so when it will not.
+///
+/// [`portal_stop`] waits rather than returning at the `pkill`, because every caller
+/// does something next that a portal still running would change:
+///
+/// * [`portal_finish`] leaves the display attached when a GUI app is up, so a
+///   teardown that raced the exit left the container forwarding a display with
+///   nothing on it — indistinguishable, to the next run and to `status`, from a
+///   sign-in in progress; and
+/// * a screen share starts a portal next, and `intune-portal` is a single
+///   instance: a launch that arrives before the old one is gone hands its request
+///   to the process on the way out, and the new display stays empty.
+fn wait_for_portal_exit() {
+    let deadline = Instant::now() + PORTAL_EXIT_WAIT;
+    while Instant::now() < deadline {
+        if !portal_is_running() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    warn!("the Intune portal is still running {PORTAL_EXIT_WAIT:?} after it was asked to close");
 }
 
 /// Return the container to headless isolation after a terminal sign-in.
@@ -824,6 +852,39 @@ mod tests {
         assert!(
             body.contains("BROKER_DISPLAY_SCRIPT"),
             "portal_start must restore the broker's display before it returns"
+        );
+    }
+
+    /// `portal_stop` has to outlive the portal it asks to close.
+    ///
+    /// A `pkill` that returns straight away leaves two callers wrong: the detach
+    /// that follows it sees a GUI app running and skips, so the container keeps
+    /// forwarding a display with nothing on it; and a screen share that starts a
+    /// portal next hands its request to the instance on the way out, and streams an
+    /// empty display. Neither shows up in a unit test — both need a container — so
+    /// the guard is on the code.
+    #[test]
+    fn closing_the_portal_waits_for_it_to_go() {
+        let source = include_str!("ops.rs");
+        let start = source
+            .split("pub fn portal_stop")
+            .nth(1)
+            .expect("portal_stop exists");
+        let body = start.split("\n}\n").next().unwrap_or(start);
+        assert!(
+            body.contains("wait_for_portal_exit"),
+            "portal_stop must wait for the exit, not just ask for it"
+        );
+        // And the wait has to end: a portal that ignores TERM must not hang the
+        // command that asked it to close.
+        let wait = source
+            .split("fn wait_for_portal_exit")
+            .nth(1)
+            .expect("the wait exists");
+        let wait = wait.split("\n}\n").next().unwrap_or(wait);
+        assert!(
+            wait.contains("deadline"),
+            "the wait must be bounded by a deadline"
         );
     }
 }

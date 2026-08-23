@@ -396,7 +396,10 @@ extern "C" fn on_signal(_: nix::libc::c_int) {
 /// dies with no unwinding, which leaves an X server running for nobody, a portal
 /// drawing into it, and the container still forwarding a display — none of which
 /// the next run can tell from a session in progress.
-fn catch_hangups() {
+///
+/// [`crate::screen`] shares it: a screen share is run over the same SSH
+/// connection, and it leaves the same three things behind.
+pub fn catch_hangups() {
     use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
     let action = SigAction::new(
         SigHandler::Handler(on_signal),

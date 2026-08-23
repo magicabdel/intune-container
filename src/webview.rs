@@ -131,6 +131,7 @@ fn serve_on(screen: &XScreen, listener: TcpListener, token: String) -> Result<Se
         seq: 0,
         current: None,
         captured: Instant::now() - MIN_CAPTURE,
+        origin: (0, 0),
         finished: false,
         portal_gone: false,
     };
@@ -241,6 +242,9 @@ struct Server<'a> {
     seq: u32,
     current: Option<Arc<Frame>>,
     captured: Instant,
+    /// Where on the display the top-left of the last frame sat. A click comes back
+    /// in the frame's coordinates and has to be put back into the display's.
+    origin: (u32, u32),
     /// The reader pressed Finish.
     finished: bool,
     /// The portal has gone; the page is told so it can stop polling.
@@ -371,14 +375,33 @@ impl Server<'_> {
         )
     }
 
-    /// The display as it is now, re-reading it only when the last read is stale.
+    /// The windows on the display as they are now, re-reading them only when the
+    /// last read is stale.
+    ///
+    /// What comes back is the box around the windows, not the display: a portal is
+    /// 478×628 on a 1280×800 screen, and a page that showed the screen would be
+    /// two thirds black. The box is remembered in [`Server::origin`], because a
+    /// click arrives in the coordinates of what was sent.
     fn capture(&mut self) -> Result<Arc<Frame>> {
         if self.current.is_none() || self.captured.elapsed() >= MIN_CAPTURE {
             // Before the picture, as in the terminal viewer: with no window manager
             // on this display, nothing else moves a new window into view or gives it
             // the keyboard.
             self.screen.place_and_focus()?;
-            self.current = Some(Arc::new(self.screen.capture()?));
+            let frame = self.screen.capture()?;
+            let frame = match self.screen.window_bounds()? {
+                Some(box_) => {
+                    self.origin = (box_.x, box_.y);
+                    frame.crop(box_)
+                }
+                // Nothing is drawn yet. The whole display is the honest answer, and
+                // the page says on it that there is no window.
+                None => {
+                    self.origin = (0, 0);
+                    frame
+                }
+            };
+            self.current = Some(Arc::new(frame));
             self.captured = Instant::now();
         }
         Ok(self.current.clone().expect("just captured"))
@@ -391,7 +414,7 @@ impl Server<'_> {
         for event in events {
             match event {
                 Event::Text { v } => {
-                    self.screen.place_and_focus()?;
+                    self.focus();
                     let refused = self.screen.type_text(&v)?;
                     if !refused.is_empty() {
                         debug!("this display's keyboard cannot type {refused:?}");
@@ -400,21 +423,49 @@ impl Server<'_> {
                 Event::Key { v } => {
                     let key = named_key(&v)
                         .with_context(|| format!("{v:?} is not a key this viewer sends"))?;
-                    self.screen.place_and_focus()?;
+                    self.focus();
                     self.screen.press(key)?;
                 }
                 Event::Mouse { x, y, down } => {
-                    self.screen.click(x, y, down)?;
+                    // The page clicks in the picture it was sent, which is the box
+                    // around the windows. XTEST wants the display.
+                    let (ox, oy) = self.origin;
+                    self.screen
+                        .click(on_display(x, ox), on_display(y, oy), down)?;
                     // A click is how a window gets the focus with no window manager
                     // around, so let it, then take the keyboard back.
                     if !down {
-                        self.screen.place_and_focus()?;
+                        self.focus();
                     }
                 }
             }
         }
         Ok(())
     }
+
+    /// Give the keyboard to the window, and carry on if that cannot be done.
+    ///
+    /// Placing and focusing is best-effort by nature: there is no window manager on
+    /// this display, and the call races the window it names — a dialog that closes
+    /// between the capture and the keystroke makes the focus request name a window
+    /// the server has already forgotten. Refusing the keystroke for that would be
+    /// the wrong trade: XTEST sends it to whatever holds the focus, which is the
+    /// window the reader was typing into a moment ago.
+    fn focus(&self) {
+        if let Err(e) = self.screen.place_and_focus() {
+            debug!("cannot place or focus the window: {e:#}");
+        }
+    }
+}
+
+/// One coordinate of a click, moved from the picture the page holds to the display
+/// the picture was cut from.
+///
+/// Saturating rather than wrapping: a click far outside a small window is a bug in
+/// the page or a stale frame, and a wrapped coordinate would land at the opposite
+/// edge — on whatever button happens to be there.
+fn on_display(point: i16, origin: u32) -> i16 {
+    point.saturating_add(origin.min(i16::MAX as u32) as i16)
 }
 
 /// What the page sends back. Text and keys are separate because a printable
@@ -833,9 +884,16 @@ fn page(width: u32, height: u32) -> String {
   html, body {{ margin: 0; height: 100%; background: #12151a; color: #d7dae0;
     font: 13px/1.5 ui-sans-serif, system-ui, sans-serif; }}
   body {{ display: flex; flex-direction: column; }}
-  #frame {{ flex: 1; display: grid; place-items: center; overflow: auto; outline: none; }}
+  #frame {{ flex: 1; display: grid; place-items: center; overflow: auto; outline: none;
+    position: relative; }}
   canvas {{ max-width: 100%; max-height: 100%; background: #000;
     box-shadow: 0 0 0 1px #2a2f37; }}
+  /* Over the canvas, and never in the way of a click: an empty display is black,
+     and a black rectangle that says nothing reads as a broken viewer. */
+  #hint {{ position: absolute; display: none; max-width: 26em; text-align: center;
+    pointer-events: none; color: #9aa1ad; background: rgba(18, 21, 26, 0.88);
+    border: 1px solid #2a2f37; border-radius: 6px; padding: 14px 18px; }}
+  #hint b {{ display: block; color: #d7dae0; font-size: 15px; margin-bottom: 6px; }}
   #bar {{ display: flex; gap: 16px; align-items: center; padding: 8px 12px;
     background: #1b1f26; border-top: 1px solid #2a2f37; }}
   #state {{ flex: 1; color: #9aa1ad; }}
@@ -846,7 +904,10 @@ fn page(width: u32, height: u32) -> String {
 </style>
 </head>
 <body>
-<div id="frame" tabindex="0"><canvas id="screen" width="{width}" height="{height}"></canvas></div>
+<div id="frame" tabindex="0"><canvas id="screen" width="{width}" height="{height}"></canvas>
+  <div id="hint"><b>Nothing is drawing on this screen yet.</b>
+  The Intune portal takes up to 30 seconds to open its first window. The picture
+  arrives on its own — there is nothing to reload.</div></div>
 <div id="bar">
   <span id="state">connecting…</span>
   <span>click the page, then type — <kbd>Ctrl</kbd>+<kbd>V</kbd> pastes</span>
@@ -858,6 +919,7 @@ const canvas = document.getElementById('screen');
 const ctx = canvas.getContext('2d', {{ alpha: false }});
 const state = document.getElementById('state');
 const frame = document.getElementById('frame');
+const hint = document.getElementById('hint');
 const KEYS = {{
   Enter: 'Return', Tab: 'Tab', Backspace: 'BackSpace', Delete: 'Delete',
   Escape: 'Escape', ArrowLeft: 'Left', ArrowRight: 'Right', ArrowUp: 'Up',
@@ -884,8 +946,16 @@ function draw(view) {{
   if (view.getUint32(0) !== 0x49435631) return false;
   // magic, seq, width, height, flags, count — then one rectangle per tile.
   seq = view.getUint32(4);
+  const width = view.getUint16(8), height = view.getUint16(10);
   const flags = view.getUint16(12);
   const count = view.getUint16(14);
+  // The picture is the box around the windows, so it changes size when a dialog
+  // opens beside the portal. Resizing the canvas clears it, and the tiles in this
+  // same answer are a whole frame — the server sends one whenever the size moves.
+  if (width && height && (canvas.width !== width || canvas.height !== height)) {{
+    canvas.width = width;
+    canvas.height = height;
+  }}
   let at = 16;
   for (let n = 0; n < count; n++) {{
     const x = view.getUint16(at), y = view.getUint16(at + 2);
@@ -903,10 +973,14 @@ function draw(view) {{
   }}
   if (flags & 2) {{
     alive = false;
+    hint.style.display = 'none';
     say('the sign-in window closed — you can close this tab');
   }} else if (!(flags & 1)) {{
-    say('waiting for the sign-in window…');
+    // The picture is a black rectangle at this point, so the reason goes ON it.
+    hint.style.display = 'block';
+    say('waiting for a window on the screen…');
   }} else {{
+    hint.style.display = 'none';
     say('sign-in window · ' + canvas.width + '×' + canvas.height);
   }}
   return count > 0;
@@ -1226,6 +1300,52 @@ mod tests {
     }
 
     #[test]
+    fn a_click_lands_where_the_window_is_and_not_where_the_picture_is() {
+        // The portal sits at 0,0, so most sessions add nothing at all.
+        assert_eq!(on_display(40, 0), 40);
+        // A broker dialog at 550,120 shifts every click in it by that much.
+        assert_eq!(on_display(40, 550), 590);
+        assert_eq!(on_display(0, 120), 120);
+        // A coordinate that would run past what XTEST can carry stops at the edge
+        // rather than wrapping onto the other side of the screen.
+        assert_eq!(on_display(i16::MAX, 10), i16::MAX);
+        assert_eq!(on_display(10, u32::MAX), i16::MAX);
+    }
+
+    #[test]
+    fn the_page_follows_a_picture_that_changes_size() {
+        let html = page(1280, 800);
+        // The box grows when a dialog opens beside the portal, so the canvas has to
+        // take its size from the answer rather than from the first page load.
+        assert!(
+            html.contains("view.getUint16(8)"),
+            "the page ignores the width the server sends"
+        );
+        assert!(html.contains("canvas.width = width"));
+        assert!(html.contains("canvas.height = height"));
+    }
+
+    #[test]
+    fn an_empty_screen_carries_its_own_explanation() {
+        let html = page(1280, 800);
+        // A display with no window is black. The reader has to be told that on the
+        // picture, because the picture is the thing that looks broken.
+        assert!(html.contains(r#"id="hint""#), "the page has no overlay");
+        assert!(
+            html.contains("Nothing is drawing on this screen yet"),
+            "the overlay says nothing"
+        );
+        // It sits over the canvas, so it must never eat a click meant for a field.
+        assert!(
+            html.contains("pointer-events: none"),
+            "the overlay would swallow clicks"
+        );
+        // Shown and hidden by the window flag, not by a timer.
+        assert!(html.contains("hint.style.display = 'block'"));
+        assert!(html.contains("hint.style.display = 'none'"));
+    }
+
+    #[test]
     fn input_is_read_as_the_page_sends_it() {
         let body = br#"[{"t":"text","v":"ab"},{"t":"key","v":"Return"},
                        {"t":"mouse","x":10,"y":20,"down":true}]"#;
@@ -1394,13 +1514,22 @@ mod tests {
                 "the page has the wrong size"
             );
 
-            // The first delta is the whole display: 800×600 is 25×19 tiles.
+            // The first delta is the whole picture, and the picture is the box
+            // around the windows rather than the display: an 80×24 xterm is a few
+            // hundred pixels on an 800×600 screen.
             let (status, body) = get("/delta?seq=0", token);
             assert_eq!(status, 200);
             assert_eq!(u32::from_be_bytes(body[0..4].try_into().unwrap()), MAGIC);
             let seq = u32::from_be_bytes(body[4..8].try_into().unwrap());
-            let count = u16::from_be_bytes(body[14..16].try_into().unwrap());
-            assert_eq!(count, 25 * 19, "the first delta was not the whole display");
+            let width = u16::from_be_bytes(body[8..10].try_into().unwrap()) as u32;
+            let height = u16::from_be_bytes(body[10..12].try_into().unwrap()) as u32;
+            let count = u16::from_be_bytes(body[14..16].try_into().unwrap()) as u32;
+            assert!(
+                width > 0 && width < 800 && height > 0 && height < 600,
+                "the picture is the whole display ({width}x{height}), not the window"
+            );
+            let tiles = width.div_ceil(TILE) * height.div_ceil(TILE);
+            assert_eq!(count, tiles, "the first delta was not the whole picture");
             assert!(seq > 0, "the first delta carried no sequence number");
 
             // xterm's background is white, so the picture must hold a white pixel:
@@ -1418,26 +1547,37 @@ mod tests {
             assert!(white, "the window never appeared in a delta");
 
             // Type into a window that belongs to xterm, not to us.
+            //
+            // Sent more than once if it has to be: the window being up is what this
+            // test can see, and a shell inside it being ready to read is not. On a
+            // loaded machine the first line can arrive before the prompt does, and
+            // that is xterm's timing rather than the input path. A line that never
+            // lands, after three passes over ten seconds each, is the path.
             let events =
                 format!(r#"[{{"t":"text","v":"touch {expect}"}},{{"t":"key","v":"Return"}}]"#);
-            let (status, _) = ask(
-                addr,
-                &format!(
-                    "POST /input HTTP/1.1\r\nHost: test\r\nX-Token: {token}\r\n\
-                     Content-Type: application/json\r\nContent-Length: {}\r\n\
-                     Connection: close\r\n\r\n{events}",
-                    events.len()
-                ),
-            );
-            assert_eq!(status, 200, "the input was refused");
-
             let mut landed = false;
-            for _ in 0..100 {
-                if std::path::Path::new(&expect).exists() {
-                    landed = true;
+            for attempt in 1..=3 {
+                let (status, _) = ask(
+                    addr,
+                    &format!(
+                        "POST /input HTTP/1.1\r\nHost: test\r\nX-Token: {token}\r\n\
+                         Content-Type: application/json\r\nContent-Length: {}\r\n\
+                         Connection: close\r\n\r\n{events}",
+                        events.len()
+                    ),
+                );
+                assert_eq!(status, 200, "the input was refused");
+                for _ in 0..100 {
+                    if std::path::Path::new(&expect).exists() {
+                        landed = true;
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                if landed {
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(100));
+                eprintln!("pass {attempt}: the line has not landed — typing it again");
             }
 
             let (status, _) = ask(
