@@ -6,6 +6,22 @@ to follow [Semantic Versioning](https://semver.org/) once it reaches 1.0.
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-09-20
+
+### Added
+- Sign in to Entra ID from a terminal, with no screen and no VNC
+- Drive the sign-in from the command, and show the window legibly
+- Serve the sign-in window to a browser over the tailnet
+- Stream the windows, and say so when there are none
+- Share the container's screen in a browser, driving nothing
+
+### Fixed
+- Never leave the broker pointing at the private display
+- Tell the reader why the browser viewer refused their link
+- Wait for the portal to exit when closing it
+- Take the next display number when another process wins the race
+- Survive AppImage relaunches and non-Debian WebKitGTK paths
+
 ## [0.2.2] - 2026-08-04
 
 ### Added
