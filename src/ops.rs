@@ -413,10 +413,12 @@ pub fn start() -> Result<StartReport> {
     }
 
     let home = std::env::var("HOME").context("HOME not set")?;
-    let self_exe = std::env::current_exe()
-        .context("cannot determine own executable path")?
-        .to_string_lossy()
-        .to_string();
+    // IMPORTANT: the wrapper script is persisted and run by the browser on
+    // future boots — it must reference a STABLE path. `current_exe()` would
+    // return the ephemeral AppImage FUSE mount (/tmp/.mount_intuneXXXXXX/…),
+    // which vanishes when this process exits and broke browser SSO on every
+    // reboot. `stable_exe()` resolves $APPIMAGE instead when applicable.
+    let self_exe = crate::exe::stable_exe()?.to_string_lossy().to_string();
 
     // 1. Wrapper script: the manifest's `path` must be a bare executable, but the
     //    browser appends args. The wrapper discards those and runs `native-host`,
@@ -430,7 +432,21 @@ pub fn start() -> Result<StartReport> {
     if let Some(parent) = std::path::Path::new(&log_path).parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let wrapper = format!("#!/bin/sh\nexec \"{self_exe}\" native-host 2>>\"{log_path}\"\n");
+    // Self-healing: prefer the pinned path, but if it disappears (binary
+    // moved, AppImage replaced/renamed) fall back to whatever `intune-container`
+    // is on PATH instead of breaking browser SSO until the next `start`.
+    let wrapper = format!(
+        "#!/bin/sh\n\
+         exe=\"{self_exe}\"\n\
+         if [ ! -x \"$exe\" ]; then\n\
+           exe=\"$(command -v intune-container || true)\"\n\
+         fi\n\
+         if [ -z \"$exe\" ] || [ ! -x \"$exe\" ]; then\n\
+           echo \"sso-native-host: intune-container binary not found (was: {self_exe})\" >>\"{log_path}\"\n\
+           exit 127\n\
+         fi\n\
+         exec \"$exe\" native-host 2>>\"{log_path}\"\n"
+    );
     std::fs::write(&wrapper_path, wrapper)?;
     use std::os::unix::fs::PermissionsExt;
     let mut perms = std::fs::metadata(&wrapper_path)?.permissions();

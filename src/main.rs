@@ -391,7 +391,10 @@ fn spawn_detached_gui() -> Result<()> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
-    let exe = std::env::current_exe().context("cannot determine own executable path")?;
+    // Stable path: the detached GUI outlives this process (and, for an
+    // AppImage, its FUSE mount — WebKit spawns helper processes from the mount
+    // path long after launch, so it must run from a re-mounted $APPIMAGE).
+    let exe = intune_container::exe::stable_exe()?;
 
     let mut cmd = Command::new(exe);
     cmd.arg("gui")

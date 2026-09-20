@@ -748,7 +748,10 @@ fn agent_timer_active(config: &Config) -> bool {
 /// Re-exec this binary as a detached `__rootless-supervise` process that boots
 /// systemd, publishes the runtime state, and stays alive to reap PID 1.
 fn spawn_supervisor(with_display: bool) -> Result<()> {
-    let exe = std::env::current_exe().context("cannot determine own executable path")?;
+    // Stable path: the supervisor is detached and outlives this process. From an
+    // AppImage, current_exe() would point into the FUSE mount, which is torn
+    // down when the launching process exits.
+    let exe = crate::exe::stable_exe()?;
     let mut cmd = Command::new(exe);
     cmd.arg("__rootless-supervise");
     if with_display {
@@ -775,7 +778,9 @@ fn spawn_supervisor(with_display: bool) -> Result<()> {
 /// Re-exec as a detached `__rootless-exec` waiter that enters the container,
 /// runs the app, and blocks until it exits (reparented when we return).
 fn spawn_exec_helper(leader: i32, uid: u32, script: &str, env: &[(String, String)]) -> Result<()> {
-    let exe = std::env::current_exe().context("cannot determine own executable path")?;
+    // Stable path for the same reason as spawn_supervisor: the waiter is
+    // detached and can outlive an AppImage's FUSE mount.
+    let exe = crate::exe::stable_exe()?;
     let mut cmd = Command::new(exe);
     cmd.arg("__rootless-exec")
         .arg(leader.to_string())

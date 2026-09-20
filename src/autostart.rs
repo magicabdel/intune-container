@@ -35,10 +35,10 @@ fn unit_path_in(config_base: PathBuf) -> PathBuf {
 /// Render the unit, pinned to the absolute path of the currently running binary
 /// so it keeps working regardless of what is (or isn't) on `PATH` at boot.
 fn render_unit() -> Result<String> {
-    let exe = std::env::current_exe()
-        .context("cannot determine own executable path")?
-        .to_string_lossy()
-        .into_owned();
+    // Must be a STABLE path: the unit is executed by systemd on future boots.
+    // For an AppImage this resolves $APPIMAGE (the real .AppImage file), never
+    // the ephemeral /tmp/.mount_* FUSE mount current_exe() would return.
+    let exe = crate::exe::stable_exe()?.to_string_lossy().into_owned();
     Ok(format!(
         "[Unit]\n\
          Description=Intune container (headless broker for SSO)\n\

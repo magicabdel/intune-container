@@ -96,6 +96,12 @@ pub fn collect() -> Vec<Check> {
         )),
     }
 
+    // Browser SSO wrapper: the native-messaging manifests point browsers at a
+    // wrapper script that pins an absolute binary path. If that path is stale
+    // (moved binary, replaced AppImage — the exact /tmp/.mount_* failure),
+    // every extension request dies silently. Catch it here.
+    checks.push(browser_sso_check());
+
     // Live checks need a running container.
     if !backend::is_running(&config) {
         checks.push(Check::new(
@@ -232,6 +238,46 @@ pub fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Check the browser SSO native-messaging wrapper: it must exist and its
+/// pinned binary path must still resolve. A stale pin (e.g. an AppImage FUSE
+/// mount under /tmp that vanished on reboot) breaks extension SSO silently.
+fn browser_sso_check() -> Check {
+    let Ok(home) = std::env::var("HOME") else {
+        return Check::new(Status::Skip, "Browser SSO", "HOME not set");
+    };
+    let wrapper = PathBuf::from(&home).join(".local/lib/intune-container/sso-native-host");
+    let Ok(body) = std::fs::read_to_string(&wrapper) else {
+        return Check::new(
+            Status::Skip,
+            "Browser SSO",
+            "not installed — run `intune-container start` to set it up",
+        );
+    };
+    // The pinned binary is the first double-quoted absolute path in the script
+    // (works for both the old `exec "/path" …` and the new `exe="/path"` form).
+    let pinned = body
+        .split('"')
+        .nth(1)
+        .filter(|s| s.starts_with('/'))
+        .map(PathBuf::from);
+    match pinned {
+        Some(p) if p.exists() => Check::new(Status::Ok, "Browser SSO", "native host installed"),
+        Some(p) => Check::new(
+            Status::Fail,
+            "Browser SSO",
+            &format!(
+                "native host points at a missing binary ({}) — re-run `intune-container start`",
+                p.display()
+            ),
+        ),
+        None => Check::new(
+            Status::Warn,
+            "Browser SSO",
+            "could not parse the native host wrapper — re-run `intune-container start`",
+        ),
+    }
 }
 
 /// The rootless persistence store (`~/.local/share/intune-container/persist`).

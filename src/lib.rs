@@ -13,6 +13,8 @@
 //! namespaces, no host root): see [`runtime`], [`oci`], and [`provision`].
 
 pub mod autostart;
+/// Stable executable-path resolution (AppImage-aware `current_exe`).
+pub mod exe;
 pub mod backend;
 pub mod backup;
 pub mod compositor;

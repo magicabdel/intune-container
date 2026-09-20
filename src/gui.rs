@@ -599,8 +599,70 @@ fn build_tray(app: &AppHandle) -> bool {
     }
 }
 
+/// Point WebKitGTK at this host's helper processes when the build-time path is
+/// wrong (**cross-distro fix**).
+///
+/// WebKitGTK hardcodes its libexec dir at build time. A binary built on
+/// Debian/Ubuntu looks for `WebKitNetworkProcess` under
+/// `/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1/`, which doesn't exist on
+/// Arch/Manjaro (`/usr/lib/webkit2gtk-4.1/`) or Fedora
+/// (`/usr/libexec/webkit2gtk-4.1/`) — the window then dies with “Failed to
+/// spawn child process”. WebKitGTK checks `$WEBKIT_EXEC_PATH` first, so
+/// setting it to wherever this host actually keeps the processes makes the
+/// same binary work on every distro.
+///
+/// Must run before the first WebView is created. Respects an existing
+/// `$WEBKIT_EXEC_PATH` (the user knows best), and prefers processes bundled
+/// inside an AppImage (`$APPDIR`) so they match the bundled library version.
+fn fixup_webkit_exec_path() {
+    if std::env::var_os("WEBKIT_EXEC_PATH").is_some() {
+        return;
+    }
+
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+
+    // AppImage-bundled processes first: they match the bundled libwebkit2gtk.
+    if let Some(appdir) = std::env::var_os("APPDIR") {
+        let base = PathBuf::from(appdir);
+        for sub in [
+            "usr/lib/x86_64-linux-gnu/webkit2gtk-4.1",
+            "usr/lib/webkit2gtk-4.1",
+            "usr/libexec/webkit2gtk-4.1",
+        ] {
+            candidates.push(base.join(sub));
+        }
+    }
+
+    // Host locations, one per packaging convention.
+    for dir in [
+        "/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1", // Debian/Ubuntu (amd64)
+        "/usr/lib/aarch64-linux-gnu/webkit2gtk-4.1", // Debian/Ubuntu (arm64)
+        "/usr/lib/webkit2gtk-4.1",                  // Arch/Manjaro
+        "/usr/libexec/webkit2gtk-4.1",              // Fedora/RHEL
+        "/usr/lib64/webkit2gtk-4.1",                // openSUSE
+    ] {
+        candidates.push(PathBuf::from(dir));
+    }
+
+    for dir in candidates {
+        if dir.join("WebKitNetworkProcess").exists() {
+            tracing::info!(path = %dir.display(), "WEBKIT_EXEC_PATH set for this host");
+            // Called from `run()` before Tauri spawns any thread that could
+            // read the environment concurrently.
+            std::env::set_var("WEBKIT_EXEC_PATH", &dir);
+            return;
+        }
+    }
+    tracing::warn!(
+        "could not locate WebKitGTK helper processes (WebKitNetworkProcess); \
+         if the window fails to open, install webkit2gtk-4.1 for your distro"
+    );
+}
+
 /// Run the Tauri interface. Blocks until the app exits.
 pub fn run() {
+    fixup_webkit_exec_path();
+
     // Hard single-instance guard. `tauri-plugin-single-instance` (below) is meant
     // to focus the existing window on relaunch, but its D-Bus dedup is unreliable
     // under some Wayland compositors, which lets tray-resident duplicates stack
