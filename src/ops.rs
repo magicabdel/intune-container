@@ -761,8 +761,13 @@ pub struct DestroyOutcome {
 
 /// Destroy the container rootfs and per-user state. Does **not** prompt — the
 /// caller is responsible for any confirmation. When `purge` is set, also removes
-/// the persistent enrollment store (`~/.local/share/intune-container/persist`)
-/// and any legacy `~/Intune` data.
+/// the persistent enrollment store (`~/.local/share/intune-container/persist`).
+///
+/// `~/Intune` is deliberately NOT touched: it was once treated as legacy data of
+/// this tool, but it is a user-visible directory that other tools (e.g. the
+/// nspawn-based `intuneme`) use as their container home — purging it destroyed
+/// another tool's enrollment state and broke its container boot (a missing
+/// bind source fails `systemd-nspawn` outright).
 pub fn destroy(purge: bool) -> Result<DestroyOutcome> {
     let config = config::Config::load().context("Failed to load configuration")?;
     let _lock = lock::LifecycleLock::acquire()?;
@@ -792,14 +797,10 @@ pub fn destroy(purge: bool) -> Result<DestroyOutcome> {
         }
     }
 
-    // 3. Remove the persistent enrollment store (+ any legacy ~/Intune) if --purge.
+    // 3. Remove the persistent enrollment store if --purge. Never touch
+    //    ~/Intune — it belongs to the user (and to other tools).
     if purge {
         backend::purge()?;
-        let intune_path = std::path::Path::new(&intune_home);
-        if intune_path.exists() {
-            debug!("Removing legacy user data: {}", intune_home);
-            let _ = std::fs::remove_dir_all(intune_path);
-        }
     }
 
     // 4. Browser SSO manifests + wrapper.

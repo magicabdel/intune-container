@@ -200,7 +200,7 @@ enum Command {
         #[arg(short, long)]
         force: bool,
 
-        /// Also remove ~/Intune data and persistent device-state
+        /// Also remove the persistent enrollment store (device-state, keyring)
         #[arg(long)]
         purge: bool,
     },
