@@ -42,7 +42,45 @@ pub fn stable_exe() -> Result<PathBuf> {
         );
     }
 
-    std::env::current_exe().context("cannot determine own executable path")
+    let exe = std::env::current_exe().context("cannot determine own executable path")?;
+
+    // Binary replaced in place while we were running (an upgrade: `install` +
+    // `mv` over it): /proc/self/exe then reads "…/intune-container (deleted)",
+    // a path that no longer exists — spawning it fails with ENOENT even though
+    // a perfectly good replacement sits at the original path. Strip the marker
+    // and use the replacement when it exists.
+    if let Some(s) = exe.to_str() {
+        if let Some(orig) = s.strip_suffix(" (deleted)") {
+            let orig = PathBuf::from(orig);
+            if orig.exists() {
+                tracing::info!(
+                    path = %orig.display(),
+                    "binary was replaced while running; using the replacement on disk"
+                );
+                return Ok(orig);
+            }
+        }
+    }
+    if !exe.exists() {
+        // Deleted with no replacement (or an unusual /proc form). Fall back to
+        // whatever `intune-container` resolves to on PATH before giving up.
+        if let Some(found) = find_on_path("intune-container") {
+            tracing::warn!(
+                path = %found.display(),
+                "own executable no longer exists; using the one on PATH"
+            );
+            return Ok(found);
+        }
+    }
+    Ok(exe)
+}
+
+/// First executable named `name` on `$PATH`, if any.
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|p| p.is_file())
 }
 
 #[cfg(test)]
