@@ -83,6 +83,11 @@ fn rootless_map() -> &'static [(&'static str, &'static str)] {
     &[
         ("state/device-broker", "device-state/device-broker"),
         ("state/intune", "device-state/intune"),
+        // Device registration keys/certs (bound from /etc/microsoft/identity-broker).
+        (
+            "state/identity-broker-etc",
+            "device-state/identity-broker-etc",
+        ),
         ("home/keyrings", "home/.local/share/keyrings"),
         (
             "home/config-broker",

@@ -93,14 +93,19 @@ async fn pull_rootfs_async(image: &str, dest: &Path) -> Result<String> {
             .context("failed to extract image layer")?;
     }
 
-    // Prefer the digest the registry reported for this manifest; fall back to a
-    // fresh HEAD only if `pull` didn't surface one.
-    let digest = match image_data.digest {
-        Some(digest) => digest,
-        None => client
-            .fetch_manifest_digest(&reference, &auth)
-            .await
-            .with_context(|| format!("failed to query the digest of {image}"))?,
+    // Stamp with the digest a HEAD on this tag returns — the SAME digest kind
+    // `remote_digest()` compares against on every start. `image_data.digest` is
+    // the *platform* manifest digest, which for a multi-arch image differs from
+    // the index digest a HEAD reports; stamping it made every future comparison
+    // a mismatch, so every start re-pulled the rootfs (wiping device
+    // registration state with it). Fall back to the pull's digest only when the
+    // HEAD fails — a wrong-kind stamp costs one redundant re-pull, not a loop,
+    // because the next successful pull re-stamps with the HEAD digest.
+    let digest = match client.fetch_manifest_digest(&reference, &auth).await {
+        Ok(digest) => digest,
+        Err(e) => image_data
+            .digest
+            .ok_or_else(|| anyhow::anyhow!("failed to query the digest of {image}: {e:#}"))?,
     };
     write_local_digest(dest, &digest)?;
 

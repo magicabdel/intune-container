@@ -434,12 +434,21 @@ fn persist_dir() -> PathBuf {
 /// All live under [`persist_dir`] so a rootfs rebuild never wipes them.
 fn persistence_binds(user: &ContainerUser) -> Result<Vec<(PathBuf, PathBuf)>> {
     let base = persist_dir();
-    let specs: [(&str, String); 5] = [
+    let specs: [(&str, String); 6] = [
         (
             "state/device-broker",
             "/var/lib/microsoft-identity-device-broker".to_string(),
         ),
         ("state/intune", "/var/lib/intune".to_string()),
+        // Device registration (Workplace Join): the DRS certificate and the
+        // session-transport keys live under /etc, NOT /var/lib. Without this
+        // bind a rootfs re-pull erased them, and the broker — whose persisted
+        // PRT is bound to those keys — answered every token call with
+        // "Decrypting failed" / "Device is not registered" (portal error 4ii4e).
+        (
+            "state/identity-broker-etc",
+            "/etc/microsoft/identity-broker".to_string(),
+        ),
         (
             "home/keyrings",
             format!("{}/.local/share/keyrings", user.home),
