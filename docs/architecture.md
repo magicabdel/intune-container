@@ -136,3 +136,38 @@ stateDiagram-v2
   user, so the container is **not** a privilege boundary beyond your own account
   — it keeps the Intune agent off your host, but a process that escapes it has
   whatever access your user has (shared network included).
+
+## Running inside a container (Docker, Kubernetes)
+
+The runtime also boots from inside another container, for an application that
+ships it in its own image. Two things change there, and both are host setup
+rather than code paths of their own.
+
+- **The cgroup.** systemd as PID 1 needs a cgroup-v2 subtree it can write. On a
+  desktop the user's systemd manager hands one over (a transient scope with
+  `Delegate=yes`). A container has no user manager, so with
+  `INTUNE_CONTAINER_CGROUP=own` the runtime makes the scope itself, as a child of
+  the cgroup it already runs in. That cgroup has to be writable by the runtime's
+  uid, which the image's entrypoint arranges while it is still root: it chowns the
+  cgroup directory and its `cgroup.procs`, `cgroup.threads` and
+  `cgroup.subtree_control`, then drops to that uid. Unset or `auto` asks the user
+  manager and falls back to `own` only when there is no manager at all; a manager
+  that refuses is still an error. `user-manager` never falls back.
+- **The id maps.** The range comes from `/etc/subuid` and `/etc/subgid` (for the
+  user name, or the uid), and must hold at least 65535 ids. `newuidmap` and
+  `newgidmap` must be able to write a map: under Docker the setuid binaries were
+  refused, while the same binaries with file capabilities
+  (`setcap cap_setuid=ep` / `cap_setgid=ep`) worked. `no-new-privileges` defeats
+  both.
+
+**Measured under Docker** (29.9, runc, cgroup v2): the image's systemd boots and
+the identity broker comes up with `--security-opt seccomp=unconfined` and
+`--security-opt systempaths=unconfined`, a root entrypoint that delegates the
+cgroup as above, and file-capability `newuidmap`. Docker's default seccomp
+profile refuses `unshare`, `mount` and `setns` to a process without
+`CAP_SYS_ADMIN`, and its masked `/proc` paths make a fresh procfs mount
+"too revealing", so neither default can be kept.
+
+**Not measured:** Kubernetes. The `RuntimeDefault` seccomp profile refuses
+`unshare` the same way Docker's does, so a pod needs either `privileged: true`
+or a user-namespaced pod (`hostUsers: false`) with a profile of its own.

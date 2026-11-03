@@ -145,8 +145,12 @@ start compares the image's digest in the registry against the one the rootfs was
 extracted from and re-pulls only when it changed (`update --check` shows both).
 
 > **Requirements:** a Linux host with **unprivileged user namespaces enabled**,
-> a `/etc/subuid` + `/etc/subgid` range for your user, `newuidmap`/`newgidmap`
-> (the `uidmap`/`shadow` package), and **cgroup v2**. No `sudo`, `systemd-nspawn`,
+> a `/etc/subuid` + `/etc/subgid` range of at least 65535 ids for your user,
+> `newuidmap`/`newgidmap` (the `uidmap`/`shadow` package), **cgroup v2**, and a
+> systemd user session to delegate the container's cgroup (inside a Docker
+> container or a Kubernetes pod, see
+> [Running inside a container](docs/architecture.md#running-inside-a-container-docker-kubernetes)).
+> No `sudo`, `systemd-nspawn`,
 > `machinectl`, `nsenter`, Docker, or Podman. **Building from source needs**
 > Rust + `just`, and **Node.js + npm** — the interface is a TypeScript / React /
 > Emotion app (in `frontend/`) that Tauri bundles into the binary at compile

@@ -6,6 +6,18 @@ to follow [Semantic Versioning](https://semver.org/) once it reaches 1.0.
 
 ## [Unreleased]
 
+### Added
+- Boot inside a Docker container or a Kubernetes pod, with no systemd user
+  session: `INTUNE_CONTAINER_CGROUP=own` makes the container's cgroup scope
+  from a cgroup the entrypoint delegated (see docs/architecture.md)
+
+### Fixed
+- Never release a half-made container when its id maps or its cgroup fail
+- Read the subordinate id range from /etc/subuid and /etc/subgid instead of
+  assuming it starts at 100000
+- Never mistake a recycled pid for the running container after a restart
+- Start the container's systemd with a clean environment
+
 ## [0.2.3] - 2026-09-20
 
 ### Added

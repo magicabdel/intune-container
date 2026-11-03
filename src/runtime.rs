@@ -2,9 +2,18 @@
 //!
 //! Creates an unprivileged user namespace (no sudo), plus mount/pid/uts
 //! namespaces, sets up `/proc`, `/dev`, `/sys` and `/run`, `pivot_root`s into a
-//! rootfs, and boots the rootfs's systemd as PID 1 (cgroup-v2 delegation via a
-//! transient scope on the user manager). The host network namespace is kept, so
-//! no slirp is needed.
+//! rootfs, and boots the rootfs's systemd as PID 1. The host network namespace
+//! is kept, so no slirp is needed.
+//!
+//! ## Where the container's cgroup comes from
+//!
+//! systemd as PID 1 needs a cgroup-v2 subtree it can write. On a desktop the
+//! user's systemd manager hands one over: a transient scope with `Delegate=yes`.
+//! Inside a Docker container or a Kubernetes pod there is no user manager at all,
+//! so the runtime makes the scope itself, as a child of the cgroup it already
+//! runs in — which only works when whoever started *that* (the container's
+//! entrypoint, run as root) handed this uid its own cgroup first. See
+//! [`CGROUP_ENV`] and [`delegate_cgroup`].
 //!
 //! ## Security profiles
 //!
@@ -216,17 +225,32 @@ pub fn start_systemd(
             close_fd(go_r);
             close_fd(gpid_w);
             let mut b = [0u8; 1];
-            let _ = unsafe { nix::libc::read(ready_r, b.as_mut_ptr() as *mut _, 1) };
+            let n = unsafe { nix::libc::read(ready_r, b.as_mut_ptr() as *mut _, 1) };
             close_fd(ready_r);
+            if n != 1 {
+                // The child `_exit`s before saying it is ready only when its
+                // `unshare` was refused. Report THAT, rather than going on to map
+                // ids into a process that no longer exists.
+                close_fd(go_w);
+                close_fd(gpid_r);
+                let status = waitpid(child, None);
+                anyhow::bail!(
+                    "could not create the container's namespaces ({status:?}): {}",
+                    NAMESPACES_REFUSED
+                );
+            }
             let scope = format!("intune-{}.scope", child.as_raw());
-            let setup = set_id_maps(child, uid, gid).and_then(|_| {
-                create_delegated_scope(child.as_raw(), &scope, hardened)?;
-                wait_in_scope(child.as_raw(), &scope);
-                Ok(())
-            });
+            let setup = set_id_maps(child, uid, gid)
+                .and_then(|_| delegate_cgroup(child.as_raw(), &scope, hardened));
+            if let Err(e) = setup {
+                // Never release a child we could not set up: it would boot
+                // systemd outside any cgroup of its own, publish no state, and
+                // keep running as an orphan nobody can find or stop.
+                abort_child(child, go_w, gpid_r);
+                return Err(e);
+            }
             let _ = unsafe { nix::libc::write(go_w, b.as_ptr() as *const _, 1) };
             close_fd(go_w);
-            setup?;
             // Receive the container PID 1's host pid.
             let mut pbuf = [0u8; 4];
             let n = unsafe { nix::libc::read(gpid_r, pbuf.as_mut_ptr() as *mut _, 4) };
@@ -269,8 +293,13 @@ pub fn start_systemd(
             let _ = unsafe { nix::libc::write(ready_w, b.as_ptr() as *const _, 1) };
             close_fd(ready_w);
             let mut r = [0u8; 1];
-            let _ = unsafe { nix::libc::read(go_r, r.as_mut_ptr() as *mut _, 1) };
+            let n = unsafe { nix::libc::read(go_r, r.as_mut_ptr() as *mut _, 1) };
             close_fd(go_r);
+            if n != 1 {
+                // The parent closed `go` without writing: the id maps or the
+                // cgroup could not be set up, so this boot is abandoned.
+                unsafe { nix::libc::_exit(124) }
+            }
 
             // In the delegated scope now: pin it as our cgroup-ns root.
             let _ = unshare(CloneFlags::CLONE_NEWCGROUP);
@@ -332,6 +361,7 @@ impl Container {
         RuntimeState {
             leader: self.leader.as_raw(),
             scope: self.scope.clone(),
+            start_time: process_start_time(self.leader.as_raw()),
         }
     }
 
@@ -389,14 +419,50 @@ pub fn exec_pid_env(
     }
 }
 
-/// Whether a container with PID 1 host pid `leader` is still alive. Checks that
-/// the process exists and still exposes a pid namespace (i.e. it's a container
-/// init, not a recycled unrelated pid).
+/// Whether a container with PID 1 host pid `leader` is still alive: the process
+/// exists, it is PID 1 of a pid namespace of its own, and that namespace is not
+/// ours.
+///
+/// Existing is not enough. A pid is recycled, and inside a Docker container or a
+/// Kubernetes pod the pid namespace starts again at 1 on every restart while the
+/// saved state survives on a volume — so the leader a previous run published is,
+/// a few pids later, an ordinary process of this one. Read as "already running",
+/// it would make every start a no-op and every stop signal a stranger.
 pub fn is_running(leader: i32) -> bool {
     if leader <= 1 {
         return false;
     }
-    Path::new(&format!("/proc/{leader}/ns/pid")).exists()
+    let status = std::fs::read_to_string(format!("/proc/{leader}/status")).unwrap_or_default();
+    is_namespace_init(&status) && !shares_namespace(leader, "pid")
+}
+
+/// Whether a `/proc/<pid>/status` says the process is PID 1 of a nested pid
+/// namespace: its `NSpid` line lists more than one pid, and the innermost is 1.
+fn is_namespace_init(status: &str) -> bool {
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("NSpid:"))
+        .map(|pids| {
+            let pids: Vec<&str> = pids.split_whitespace().collect();
+            pids.len() > 1 && pids.last() == Some(&"1")
+        })
+        .unwrap_or(false)
+}
+
+/// The start time of `pid` in clock ticks since boot (field 22 of
+/// `/proc/<pid>/stat`), which tells a process apart from a later one that was
+/// handed the same pid.
+pub fn process_start_time(pid: i32) -> Option<u64> {
+    stat_start_time(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
+/// Field 22 of a `/proc/<pid>/stat` line. The command name (field 2) is in
+/// parentheses and may itself hold spaces and parentheses, so fields are counted
+/// from the LAST `)`.
+fn stat_start_time(stat: &str) -> Option<u64> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    // `rest` starts at field 3 (state), so field 22 is the 20th one.
+    rest.split_whitespace().nth(19)?.parse().ok()
 }
 
 /// Ask the container's systemd (PID 1 host pid `leader`) to power off by sending
@@ -871,6 +937,14 @@ fn init_systemd(rootfs: &Path, binds: &[(PathBuf, PathBuf)], log_fd: Option<RawF
         let _ = dup2(devnull.as_raw_fd(), 0);
     }
 
+    // PID 1 starts with nothing it did not ask for. Whatever launched the
+    // supervisor — a desktop session, a service, an app that embeds this crate —
+    // would otherwise hand the container's init its whole environment, readable
+    // by root inside the container at /proc/1/environ for the container's life:
+    // session bus addresses, tokens, credentials.
+    for (key, _) in std::env::vars_os() {
+        std::env::remove_var(key);
+    }
     // Tell systemd it's in a container so it uses container mode (skips host-only
     // setup). Any non-empty value works; this matches the nspawn/podman pattern.
     std::env::set_var("container", "intune-container");
@@ -890,11 +964,23 @@ fn init_systemd(rootfs: &Path, binds: &[(PathBuf, PathBuf)], log_fd: Option<RawF
     }
 }
 
-/// Map container ids using the setuid `newuidmap`/`newgidmap` helpers: id 0 maps
-/// to the caller, ids 1.. map to the subuid/subgid range (base 100000).
+/// How many ids the container maps above its root: 1..=65535, the whole range a
+/// distribution's users and groups live in (`nobody` is 65534).
+const CONTAINER_IDS: u32 = 65535;
+
+/// Map container ids using the `newuidmap`/`newgidmap` helpers: id 0 maps to the
+/// caller, ids 1..=65535 to the start of the caller's own range in `/etc/subuid`
+/// and `/etc/subgid`.
+///
+/// The range is READ, never assumed. It used to be a hard-coded 100000, which is
+/// only the most common default: a host that allocated the user another range —
+/// and every container or pod whose uids are themselves remapped, where 100000 is
+/// not a uid at all — refused the map with nothing saying why.
 fn set_id_maps(child: Pid, uid: u32, gid: u32) -> Result<()> {
     let pid = child.as_raw().to_string();
-    let run = |bin: &str, owner: u32| -> Result<()> {
+    let user = login_name(uid);
+    let run = |bin: &str, file: &str, owner: u32| -> Result<()> {
+        let start = subordinate_start(file, &user, owner)?;
         let status = std::process::Command::new(bin)
             .args([
                 pid.as_str(),
@@ -902,19 +988,86 @@ fn set_id_maps(child: Pid, uid: u32, gid: u32) -> Result<()> {
                 &owner.to_string(),
                 "1",
                 "1",
-                "100000",
-                "65535",
+                &start.to_string(),
+                &CONTAINER_IDS.to_string(),
             ])
             .status()
-            .with_context(|| format!("run {bin}"))?;
+            .with_context(|| format!("run {bin} (is the uidmap package installed?)"))?;
         if !status.success() {
-            anyhow::bail!("{bin} failed (is the subuid/subgid range configured?)");
+            anyhow::bail!(
+                "{bin} refused to map {CONTAINER_IDS} ids from {start} ({file}): it needs \
+                 to be setuid root or to carry the cap_setuid/cap_setgid file capability, \
+                 and it cannot gain either under no_new_privs"
+            );
         }
         Ok(())
     };
-    run("newuidmap", uid)?;
-    run("newgidmap", gid)?;
+    run("newuidmap", SUBUID, uid)?;
+    run("newgidmap", SUBGID, gid)?;
     Ok(())
+}
+
+const SUBUID: &str = "/etc/subuid";
+const SUBGID: &str = "/etc/subgid";
+
+/// The first id of `user`'s range in `file` (`/etc/subuid` or `/etc/subgid`),
+/// refusing a range too small to hold a distribution's ids.
+fn subordinate_start(file: &str, user: &str, owner: u32) -> Result<u32> {
+    let contents = std::fs::read_to_string(file).with_context(|| format!("read {file}"))?;
+    let (start, count) = subid_range(&contents, user, owner).with_context(|| {
+        format!(
+            "{file} has no range for {user} (uid {owner}): run usermod --add-subuids/--add-subgids"
+        )
+    })?;
+    if count < CONTAINER_IDS {
+        anyhow::bail!(
+            "{file} gives {user} {count} ids from {start}; the container needs {CONTAINER_IDS}"
+        );
+    }
+    Ok(start)
+}
+
+/// The `(start, count)` of the first `name:start:count` line of a subuid/subgid
+/// file that names `user` or the numeric `uid` — the two spellings `newuidmap`
+/// itself accepts.
+fn subid_range(contents: &str, user: &str, uid: u32) -> Option<(u32, u32)> {
+    let uid = uid.to_string();
+    contents.lines().find_map(|line| {
+        let mut f = line.trim().split(':');
+        let name = f.next()?;
+        if name.is_empty() || (name != user && name != uid) {
+            return None;
+        }
+        let start = f.next()?.parse().ok()?;
+        let count = f.next()?.parse().ok()?;
+        Some((start, count))
+    })
+}
+
+/// The login name of `uid`, the way `newuidmap` resolves it (the password
+/// database), falling back to `$USER` and then to the number itself. `$USER`
+/// alone is not enough: a container image rarely sets it.
+fn login_name(uid: u32) -> String {
+    nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
+        .ok()
+        .flatten()
+        .map(|u| u.name)
+        .or_else(|| std::env::var("USER").ok().filter(|u| !u.is_empty()))
+        .unwrap_or_else(|| uid.to_string())
+}
+
+/// What a refused `unshare` means, wherever it surfaces.
+const NAMESPACES_REFUSED: &str = "unprivileged user namespaces are refused here \
+     (inside Docker or Kubernetes the default seccomp profile refuses unshare, mount and \
+     pivot_root; an AppArmor policy or a sysctl can too)";
+
+/// Abandon a child the parent could not finish setting up: kill it, close the
+/// pipes it waits on, and reap it so nothing is left behind.
+fn abort_child(child: Pid, go_w: RawFd, gpid_r: RawFd) {
+    let _ = nix::sys::signal::kill(child, Signal::SIGKILL);
+    close_fd(go_w);
+    close_fd(gpid_r);
+    let _ = waitpid(child, None);
 }
 
 /// Remove `path` recursively, even when it contains files owned by our subuids
@@ -935,12 +1088,24 @@ pub fn remove_tree_as_root(path: &Path) -> Result<()> {
             close_fd(ready_w);
             close_fd(go_r);
             let mut b = [0u8; 1];
-            let _ = unsafe { nix::libc::read(ready_r, b.as_mut_ptr() as *mut _, 1) };
+            let n = unsafe { nix::libc::read(ready_r, b.as_mut_ptr() as *mut _, 1) };
             close_fd(ready_r);
-            let maps = set_id_maps(child, uid, gid);
+            if n != 1 {
+                close_fd(go_w);
+                let status = waitpid(child, None);
+                anyhow::bail!(
+                    "could not remove {} ({status:?}): {NAMESPACES_REFUSED}",
+                    path.display()
+                );
+            }
+            if let Err(e) = set_id_maps(child, uid, gid) {
+                let _ = nix::sys::signal::kill(child, Signal::SIGKILL);
+                close_fd(go_w);
+                let _ = waitpid(child, None);
+                return Err(e);
+            }
             let _ = unsafe { nix::libc::write(go_w, b.as_ptr() as *const _, 1) };
             close_fd(go_w);
-            maps?;
             match waitpid(child, None).context("waitpid")? {
                 WaitStatus::Exited(_, 0) => Ok(()),
                 WaitStatus::Exited(_, code) => {
@@ -959,13 +1124,20 @@ pub fn remove_tree_as_root(path: &Path) -> Result<()> {
                 let _ = unsafe { nix::libc::write(ready_w, b.as_ptr() as *const _, 1) };
                 close_fd(ready_w);
                 let mut r = [0u8; 1];
-                let _ = unsafe { nix::libc::read(go_r, r.as_mut_ptr() as *mut _, 1) };
+                let n = unsafe { nix::libc::read(go_r, r.as_mut_ptr() as *mut _, 1) };
                 close_fd(go_r);
-                // Now uid 0 in the namespace (mapped to the host user), with the
-                // subuid range mapped too, so we can unlink subuid-owned files.
-                match std::fs::remove_dir_all(path) {
-                    Ok(()) => 0,
-                    Err(_) => 1,
+                if n != 1 {
+                    // The parent could not map our ids: removing as an unmapped
+                    // root would fail on every subuid-owned file anyway.
+                    124
+                } else {
+                    // Now uid 0 in the namespace (mapped to the host user), with
+                    // the subuid range mapped too, so we can unlink subuid-owned
+                    // files.
+                    match std::fs::remove_dir_all(path) {
+                        Ok(()) => 0,
+                        Err(_) => 1,
+                    }
                 }
             };
             unsafe { nix::libc::_exit(code) }
@@ -1002,6 +1174,109 @@ fn spawn_watchdog(group_leader: Pid, after: Duration) {
     });
 }
 
+/// The environment variable that chooses where the container's cgroup comes
+/// from:
+///
+/// - `user-manager` — a transient scope from the user's systemd manager over the
+///   session bus, the desktop case. A manager that refuses is an error.
+/// - `own` — a child of the cgroup this process already runs in, made by this
+///   runtime. Inside a Docker container or a Kubernetes pod there is no user
+///   manager, and this is the only way in: it needs that cgroup to be writable
+///   by this uid, which the container's entrypoint (run as root) arranges by
+///   chowning it and its `cgroup.procs`, `cgroup.threads` and
+///   `cgroup.subtree_control` before dropping to this uid.
+/// - unset or `auto` — the user manager when one answers, and `own` only when
+///   there is NO user manager to ask (no session bus, or nothing owning
+///   `org.freedesktop.systemd1` on it). A manager that is there and refuses is
+///   still an error: falling back then would put the container inside whatever
+///   cgroup the caller happens to run in — a terminal's scope, say — to be
+///   killed with it.
+///
+/// An embedding application that knows it runs inside a container should set
+/// `own`, so the outcome never depends on a session bus it may have inherited.
+pub const CGROUP_ENV: &str = "INTUNE_CONTAINER_CGROUP";
+
+/// Where the container's cgroup comes from (see [`CGROUP_ENV`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Delegation {
+    Auto,
+    UserManager,
+    Own,
+}
+
+/// Read [`CGROUP_ENV`]. An unknown value is refused rather than guessed at.
+fn delegation_from(value: Option<&str>) -> Result<Delegation> {
+    match value.map(str::trim) {
+        None | Some("") | Some("auto") => Ok(Delegation::Auto),
+        Some("user-manager") => Ok(Delegation::UserManager),
+        Some("own") => Ok(Delegation::Own),
+        Some(other) => {
+            anyhow::bail!("{CGROUP_ENV}={other:?}: expected user-manager, own or auto")
+        }
+    }
+}
+
+/// Put `pid` (the container's intermediate process, not yet in its cgroup
+/// namespace) into a cgroup the container's systemd can write, named `scope`.
+fn delegate_cgroup(pid: i32, scope: &str, hardened: bool) -> Result<()> {
+    let mode = delegation_from(std::env::var(CGROUP_ENV).ok().as_deref())?;
+    match mode {
+        Delegation::Own => own_scope(pid, scope),
+        Delegation::UserManager => {
+            create_delegated_scope(pid, scope, hardened).map_err(ScopeError::into_error)?;
+            wait_in_scope(pid, scope);
+            Ok(())
+        }
+        Delegation::Auto => match create_delegated_scope(pid, scope, hardened) {
+            Ok(()) => {
+                wait_in_scope(pid, scope);
+                Ok(())
+            }
+            Err(ScopeError::NoUserManager(why)) => {
+                tracing::info!(
+                    "no systemd user manager to delegate a cgroup ({why:#}); using a child of our own cgroup"
+                );
+                own_scope(pid, scope).with_context(|| {
+                    format!("there is no systemd user manager here ({why:#}), and")
+                })
+            }
+            Err(e) => Err(e.into_error()),
+        },
+    }
+}
+
+/// Why the user manager could not provide a scope.
+#[derive(Debug)]
+enum ScopeError {
+    /// There is no user manager to ask: no session bus, or nothing owns
+    /// `org.freedesktop.systemd1` on it.
+    NoUserManager(anyhow::Error),
+    /// A user manager answered, and refused.
+    Refused(anyhow::Error),
+}
+
+impl ScopeError {
+    fn into_error(self) -> anyhow::Error {
+        match self {
+            ScopeError::NoUserManager(e) => {
+                e.context("no systemd user manager to delegate the container's cgroup")
+            }
+            ScopeError::Refused(e) => e,
+        }
+    }
+}
+
+/// Whether a D-Bus error name means nobody is there to answer, as opposed to
+/// somebody answering no.
+fn means_no_manager(error_name: &str) -> bool {
+    matches!(
+        error_name,
+        "org.freedesktop.DBus.Error.ServiceUnknown"
+            | "org.freedesktop.DBus.Error.NameHasNoOwner"
+            | "org.freedesktop.DBus.Error.UnknownObject"
+    )
+}
+
 /// Ask the user's systemd manager (over the session bus) to place `pid` into a
 /// transient scope (`scope`) with cgroup **delegation**, so a `cgroup2` mounted
 /// inside is writable and systemd can manage its own subtree.
@@ -1011,7 +1286,7 @@ fn spawn_watchdog(group_leader: Pid, after: Duration) {
 /// `hardened` profile additionally caps memory: the headless daemon (broker +
 /// compliance agent) is light, so a hard ceiling contains a runaway without
 /// risking the OOM-kill of a legitimate forwarded browser.
-fn create_delegated_scope(pid: i32, scope: &str, hardened: bool) -> Result<()> {
+fn create_delegated_scope(pid: i32, scope: &str, hardened: bool) -> Result<(), ScopeError> {
     // Process-count ceiling, both profiles. High enough for a browser's helpers.
     const TASKS_MAX: u64 = 8192;
     // Memory ceilings, hardened profile only. `High` throttles via reclaim before
@@ -1022,11 +1297,13 @@ fn create_delegated_scope(pid: i32, scope: &str, hardened: bool) -> Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .context("build runtime for scope setup")?;
+        .context("build runtime for scope setup")
+        .map_err(ScopeError::Refused)?;
     rt.block_on(async {
         let conn = zbus::Connection::session()
             .await
-            .context("connect to the user session bus")?;
+            .context("connect to the user session bus")
+            .map_err(ScopeError::NoUserManager)?;
         let proxy = zbus::Proxy::new(
             &conn,
             "org.freedesktop.systemd1",
@@ -1034,7 +1311,8 @@ fn create_delegated_scope(pid: i32, scope: &str, hardened: bool) -> Result<()> {
             "org.freedesktop.systemd1.Manager",
         )
         .await
-        .context("open systemd manager proxy")?;
+        .context("open systemd manager proxy")
+        .map_err(ScopeError::Refused)?;
 
         // StartTransientUnit(name, mode, properties: a(sv), aux: a(sa(sv))) -> o
         let mut props: Vec<(&str, zbus::zvariant::Value)> = vec![
@@ -1051,11 +1329,18 @@ fn create_delegated_scope(pid: i32, scope: &str, hardened: bool) -> Result<()> {
             props.push(("MemoryMax", zbus::zvariant::Value::from(MEMORY_MAX)));
         }
         let aux: Vec<(&str, Vec<(&str, zbus::zvariant::Value)>)> = Vec::new();
-        let _job: zbus::zvariant::OwnedObjectPath = proxy
+        let reply: zbus::Result<zbus::zvariant::OwnedObjectPath> = proxy
             .call("StartTransientUnit", &(scope, "replace", props, aux))
-            .await
-            .context("StartTransientUnit")?;
-        Ok::<(), anyhow::Error>(())
+            .await;
+        match reply {
+            Ok(_job) => Ok(()),
+            Err(zbus::Error::MethodError(name, _, _)) if means_no_manager(name.as_str()) => Err(
+                ScopeError::NoUserManager(anyhow::anyhow!("{name} on the session bus")),
+            ),
+            Err(e) => Err(ScopeError::Refused(
+                anyhow::Error::from(e).context("StartTransientUnit"),
+            )),
+        }
     })
 }
 
@@ -1071,6 +1356,157 @@ fn wait_in_scope(pid: i32, scope: &str) {
     }
 }
 
+/// The cgroup-v2 path of this process, relative to the cgroup root it sees
+/// (`0::/path` in `/proc/self/cgroup`; `0::/` inside a container with a cgroup
+/// namespace of its own).
+fn own_cgroup_path(proc_self_cgroup: &str) -> Option<PathBuf> {
+    proc_self_cgroup
+        .lines()
+        .find_map(|l| l.strip_prefix("0::"))
+        .map(|p| PathBuf::from(p.trim().trim_start_matches('/')))
+}
+
+/// Put `pid` into `scope`, a new child of the cgroup this process runs in, with
+/// no user manager involved (see [`CGROUP_ENV`]).
+///
+/// No controller is enabled for it: enabling one would first mean moving every
+/// other process out of our cgroup (cgroup v2 allows no process beside an
+/// enabled controller), and those processes are the embedding application's,
+/// not ours. So TasksMax and MemoryMax do not apply here; the limits of the
+/// Docker container or pod around us are the ceiling.
+fn own_scope(pid: i32, scope: &str) -> Result<()> {
+    let rel = own_cgroup_path(
+        &std::fs::read_to_string("/proc/self/cgroup").context("read /proc/self/cgroup")?,
+    )
+    .context("this process is not on the cgroup v2 hierarchy")?;
+    let base = Path::new("/sys/fs/cgroup").join(&rel);
+    match place_in_new_cgroup(&base, pid, scope) {
+        Ok(()) => Ok(()),
+        // A container runtime mounts /sys/fs/cgroup read-only. That is a property
+        // of the MOUNT, not of the files: a fresh cgroup2 mount in a namespace of
+        // our own is writable wherever the files are ours.
+        Err(e) if e.raw_os_error() == Some(nix::libc::EROFS) => {
+            place_through_private_mount(pid, scope)
+        }
+        Err(e) => Err(anyhow::Error::from(e)).with_context(|| own_cgroup_refused(&base)),
+    }
+}
+
+/// What a refusal to write our own cgroup means, and who can fix it.
+fn own_cgroup_refused(base: &Path) -> String {
+    format!(
+        "cannot create a cgroup for the container under {} as uid {}: the cgroup this \
+         process runs in must be delegated to it (chown it and its cgroup.procs, \
+         cgroup.threads and cgroup.subtree_control to this uid, as root, before \
+         starting this process)",
+        base.display(),
+        getuid()
+    )
+}
+
+/// Create `root/scope` (tolerating one left by an earlier boot) and move `pid`
+/// into it.
+fn place_in_new_cgroup(root: &Path, pid: i32, scope: &str) -> std::io::Result<()> {
+    let dir = root.join(scope);
+    match std::fs::create_dir(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    std::fs::write(dir.join("cgroup.procs"), pid.to_string())
+}
+
+/// [`place_in_new_cgroup`] through a cgroup2 mount of our own: in a forked child,
+/// unshare a user, mount and cgroup namespace (whose root is our cgroup), mount
+/// cgroup2 over `/sys/fs/cgroup` there, and do the move. The mount dies with the
+/// child.
+///
+/// The read-only mount is first covered with a tmpfs, exactly as the
+/// container's own init does: cgroup2 is ONE superblock, and the kernel refuses
+/// to mount a filesystem on the root of a mount of that same filesystem
+/// (`EBUSY`).
+fn place_through_private_mount(pid: i32, scope: &str) -> Result<()> {
+    let (uid, gid) = (getuid().as_raw(), getgid().as_raw());
+    match unsafe { fork() }.context("fork")? {
+        ForkResult::Parent { child } => match waitpid(child, None).context("waitpid")? {
+            WaitStatus::Exited(_, 0) => Ok(()),
+            WaitStatus::Exited(_, 125) => anyhow::bail!(
+                "could not delegate the container's cgroup through a namespace of our own: \
+                 {NAMESPACES_REFUSED}"
+            ),
+            WaitStatus::Exited(_, 124) => anyhow::bail!(
+                "could not mount a cgroup2 of our own to delegate the container's cgroup \
+                 (the reason is on stderr)"
+            ),
+            other => anyhow::bail!(
+                "{} ({other:?})",
+                own_cgroup_refused(Path::new("/sys/fs/cgroup"))
+            ),
+        },
+        ForkResult::Child => {
+            let namespaces = (|| -> Result<()> {
+                unshare(CloneFlags::CLONE_NEWUSER).context("unshare a user namespace")?;
+                std::fs::write("/proc/self/setgroups", "deny").ok();
+                std::fs::write("/proc/self/uid_map", format!("0 {uid} 1\n"))
+                    .context("write uid_map")?;
+                std::fs::write("/proc/self/gid_map", format!("0 {gid} 1\n"))
+                    .context("write gid_map")?;
+                unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWCGROUP)
+                    .context("unshare a mount and cgroup namespace")?;
+                Ok(())
+            })();
+            let mounted = namespaces.as_ref().map_err(|_| ()).and_then(|()| {
+                let nosuid = MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC | MsFlags::MS_NODEV;
+                (|| -> Result<()> {
+                    mount(
+                        None::<&str>,
+                        "/",
+                        None::<&str>,
+                        MsFlags::MS_REC | MsFlags::MS_PRIVATE,
+                        None::<&str>,
+                    )
+                    .context("make / private")?;
+                    mount(
+                        Some("tmpfs"),
+                        "/sys/fs/cgroup",
+                        Some("tmpfs"),
+                        nosuid,
+                        Some("mode=0755"),
+                    )
+                    .context("cover /sys/fs/cgroup with a tmpfs")?;
+                    mount(
+                        Some("cgroup2"),
+                        "/sys/fs/cgroup",
+                        Some("cgroup2"),
+                        nosuid,
+                        None::<&str>,
+                    )
+                    .context("mount cgroup2")?;
+                    Ok(())
+                })()
+                .map_err(|e| eprintln!("cgroup delegation: {e:#}"))
+            });
+            let code = match (&namespaces, mounted) {
+                (Err(e), _) => {
+                    eprintln!("cgroup delegation: {e:#}");
+                    125
+                }
+                (Ok(()), Err(())) => 124,
+                (Ok(()), Ok(())) => {
+                    match place_in_new_cgroup(Path::new("/sys/fs/cgroup"), pid, scope) {
+                        Ok(()) => 0,
+                        Err(e) => {
+                            eprintln!("cgroup delegation: {e}");
+                            1
+                        }
+                    }
+                }
+            };
+            unsafe { nix::libc::_exit(code) }
+        }
+    }
+}
+
 // ===== Cross-process runtime state =====
 
 /// Handles to a running rootless container, persisted so a separate process can
@@ -1080,8 +1516,13 @@ fn wait_in_scope(pid: i32, scope: &str) {
 pub struct RuntimeState {
     /// Host pid of the container's PID 1 (systemd).
     pub leader: i32,
-    /// The transient systemd scope holding the container's cgroup.
+    /// The cgroup scope holding the container (a transient unit of the user
+    /// manager, or a child of our own cgroup — see [`delegate_cgroup`]).
     pub scope: String,
+    /// The leader's start time (see [`process_start_time`]), so a recycled pid
+    /// is never mistaken for it. Absent in state written by an older version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_time: Option<u64>,
 }
 
 /// Per-user data directory (`$XDG_DATA_HOME` or `~/.local/share`).
@@ -1135,13 +1576,24 @@ pub fn clear_runtime_state() -> Result<()> {
 /// pid. Stale state (process gone) is cleared and reported as `None`.
 pub fn running_leader() -> Result<Option<i32>> {
     match load_runtime_state()? {
-        Some(state) if is_running(state.leader) => Ok(Some(state.leader)),
+        Some(state) if state_is_live(&state) => Ok(Some(state.leader)),
         Some(_) => {
             let _ = clear_runtime_state();
             Ok(None)
         }
         None => Ok(None),
     }
+}
+
+/// Whether `state` still describes a running container: its leader is a
+/// container init ([`is_running`]) and, where the state recorded one, it is the
+/// very process that was started.
+fn state_is_live(state: &RuntimeState) -> bool {
+    is_running(state.leader)
+        && match state.start_time {
+            Some(recorded) => process_start_time(state.leader) == Some(recorded),
+            None => true,
+        }
 }
 
 // ===== Host preflight =====
@@ -1178,14 +1630,16 @@ pub fn preflight() -> Result<()> {
             );
         }
     }
-    // A subuid/subgid range must be allocated for multi-id mapping.
-    let user = std::env::var("USER").unwrap_or_default();
+    // A subuid/subgid range large enough for a distribution's ids must be
+    // allocated, and the helpers that apply it must be installed.
     let uid = getuid().as_raw();
-    if !has_subid_range("/etc/subuid", &user, uid) {
-        anyhow::bail!("no /etc/subuid range for the current user (run: usermod --add-subuids ...)");
-    }
-    if !has_subid_range("/etc/subgid", &user, uid) {
-        anyhow::bail!("no /etc/subgid range for the current user (run: usermod --add-subgids ...)");
+    let user = login_name(uid);
+    subordinate_start(SUBUID, &user, uid)?;
+    subordinate_start(SUBGID, &user, getgid().as_raw())?;
+    for helper in ["newuidmap", "newgidmap"] {
+        if !on_path(helper) {
+            anyhow::bail!("{helper} is not installed (it comes with the uidmap / shadow package)");
+        }
     }
     // cgroup v2 must be mounted (unified hierarchy) for delegation.
     let mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
@@ -1201,15 +1655,15 @@ pub fn preflight() -> Result<()> {
     Ok(())
 }
 
-/// Whether `file` (subuid/subgid format `name:start:count`) has an entry for the
-/// given user name or numeric uid.
-fn has_subid_range(file: &str, user: &str, uid: u32) -> bool {
-    let uid_s = uid.to_string();
-    std::fs::read_to_string(file)
-        .map(|s| {
-            s.lines().any(|l| {
-                let name = l.split(':').next().unwrap_or("");
-                !name.is_empty() && (name == user || name == uid_s)
+/// Whether an executable named `name` is on `$PATH`.
+fn on_path(name: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::var_os("PATH")
+        .map(|paths| {
+            std::env::split_paths(&paths).any(|dir| {
+                std::fs::metadata(dir.join(name))
+                    .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                    .unwrap_or(false)
             })
         })
         .unwrap_or(false)
@@ -1441,6 +1895,167 @@ mod tests {
         .unwrap_or(1);
         let _ = c.stop();
         assert_eq!(code, 0, "display env not delivered to launched process");
+    }
+
+    /// Boot systemd with NO user manager — the cgroup made by this runtime as a
+    /// child of its own — then `setns` into it. This is the Docker / Kubernetes
+    /// case, and the only way to exercise it is to run inside one: the
+    /// container's entrypoint must hand this uid its own cgroup first (see
+    /// `CGROUP_ENV`). From a desktop this test is refused at that step.
+    ///   INTUNE_CONTAINER_CGROUP=own cargo test --lib exec_without_a_user_manager -- --ignored --nocapture
+    #[test]
+    #[ignore = "boots systemd in a container without a user manager; run inside one"]
+    fn exec_without_a_user_manager() {
+        std::env::set_var(super::CGROUP_ENV, "own");
+        let rootfs = ensure_rootfs();
+        let _ = fs::remove_file(
+            rootfs.join("etc/systemd/system/multi-user.target.wants/intune-probe.service"),
+        );
+        let log = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("exec-own-cgroup-boot.log");
+        let _ = fs::remove_file(&log);
+
+        let c = start_systemd(&rootfs, &[], Some(&log), true).unwrap();
+        assert!(c.scope.starts_with("intune-"), "scope {:?}", c.scope);
+        let cgroup = fs::read_to_string(format!("/proc/{}/cgroup", c.leader_pid())).unwrap();
+        eprintln!("leader cgroup: {cgroup:?}");
+
+        let mut running = String::new();
+        let mut broker = false;
+        for _ in 0..60 {
+            if c.exec(
+                &[
+                    "/usr/bin/systemctl",
+                    "is-active",
+                    "--quiet",
+                    "microsoft-identity-device-broker.service",
+                ],
+                None,
+            )
+            .unwrap_or(1)
+                == 0
+            {
+                broker = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        let _ = c.exec(
+            &[
+                "/usr/bin/sh",
+                "-c",
+                "systemctl is-system-running > /run/state 2>&1; cat /run/state; systemctl --failed --no-legend",
+            ],
+            None,
+        );
+        if let Ok(l) = fs::read_to_string(&log) {
+            let lines: Vec<&str> = l.lines().collect();
+            running = lines[lines.len().saturating_sub(30)..].join("\n");
+        }
+        let _ = c.stop();
+        assert!(
+            broker,
+            "broker not active without a user manager; boot log tail:\n{running}"
+        );
+    }
+
+    #[test]
+    fn a_subordinate_range_is_read_for_the_name_or_the_uid() {
+        let file = "# comment\nalice:200000:65536\n1000:300000:65536\nbob:400000:1000\n";
+        assert_eq!(
+            super::subid_range(file, "alice", 1001),
+            Some((200000, 65536))
+        );
+        // newuidmap accepts the numeric spelling too, which is what an image
+        // with no $USER and no password-database name has.
+        assert_eq!(
+            super::subid_range(file, "teams", 1000),
+            Some((300000, 65536))
+        );
+        assert_eq!(super::subid_range(file, "bob", 1002), Some((400000, 1000)));
+        assert_eq!(super::subid_range(file, "carol", 1003), None);
+        // A malformed line is skipped rather than read as a range.
+        assert_eq!(super::subid_range("alice:x:65536\n", "alice", 1), None);
+        // An empty name never matches anybody.
+        assert_eq!(super::subid_range(":1:65536\n", "", 1), None);
+    }
+
+    #[test]
+    fn a_container_init_is_pid_one_of_a_namespace_of_its_own() {
+        assert!(super::is_namespace_init(
+            "Name:\tsystemd\nNSpid:\t6415\t1\n"
+        ));
+        assert!(super::is_namespace_init("NSpid:\t9\t40\t1\n"));
+        // An ordinary process that was handed a recycled pid.
+        assert!(!super::is_namespace_init("Name:\tbash\nNSpid:\t6415\n"));
+        // PID 40 of a nested namespace is not that namespace's init.
+        assert!(!super::is_namespace_init("NSpid:\t6415\t40\n"));
+        assert!(!super::is_namespace_init(""));
+        // This test's own process is no container init.
+        assert!(!super::is_running(std::process::id() as i32));
+    }
+
+    #[test]
+    fn a_start_time_is_field_twenty_two_counted_from_the_last_parenthesis() {
+        let fields: Vec<String> = (3..=30).map(|n| n.to_string()).collect();
+        let stat = format!("4242 (we(ird) name) {}", fields.join(" "));
+        assert_eq!(super::stat_start_time(&stat), Some(22));
+        assert_eq!(super::stat_start_time("garbage"), None);
+        assert!(super::process_start_time(std::process::id() as i32).is_some());
+    }
+
+    #[test]
+    fn a_state_without_a_start_time_still_reads() {
+        let old: super::RuntimeState =
+            serde_json::from_str(r#"{"leader": 12, "scope": "intune-11.scope"}"#).unwrap();
+        assert_eq!(old.start_time, None);
+        let new = serde_json::to_string(&super::RuntimeState {
+            start_time: Some(7),
+            ..old
+        })
+        .unwrap();
+        assert!(new.contains(r#""start_time":7"#), "{new}");
+    }
+
+    #[test]
+    fn the_own_cgroup_is_read_from_the_unified_line() {
+        assert_eq!(super::own_cgroup_path("0::/\n"), Some(PathBuf::from("")));
+        assert_eq!(
+            super::own_cgroup_path("0::/kubepods.slice/pod1/cri-x.scope\n"),
+            Some(PathBuf::from("kubepods.slice/pod1/cri-x.scope"))
+        );
+        // A v1-only hierarchy offers no unified line.
+        assert_eq!(super::own_cgroup_path("1:name=systemd:/user.slice\n"), None);
+    }
+
+    #[test]
+    fn the_cgroup_source_is_chosen_by_name_and_an_unknown_one_is_refused() {
+        use super::{delegation_from, Delegation};
+        assert_eq!(delegation_from(None).unwrap(), Delegation::Auto);
+        assert_eq!(delegation_from(Some("")).unwrap(), Delegation::Auto);
+        assert_eq!(delegation_from(Some("own")).unwrap(), Delegation::Own);
+        assert_eq!(
+            delegation_from(Some("user-manager")).unwrap(),
+            Delegation::UserManager
+        );
+        assert!(delegation_from(Some("direct")).is_err());
+    }
+
+    #[test]
+    fn only_an_absent_manager_falls_back_never_a_refusal() {
+        assert!(super::means_no_manager(
+            "org.freedesktop.DBus.Error.ServiceUnknown"
+        ));
+        assert!(super::means_no_manager(
+            "org.freedesktop.DBus.Error.NameHasNoOwner"
+        ));
+        assert!(!super::means_no_manager(
+            "org.freedesktop.DBus.Error.AccessDenied"
+        ));
+        assert!(!super::means_no_manager(
+            "org.freedesktop.systemd1.UnitExists"
+        ));
     }
 
     /// Report this host's rootless readiness (always runs; never fails the
