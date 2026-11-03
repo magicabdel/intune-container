@@ -81,11 +81,25 @@ fn rootless_persist_dir() -> Result<PathBuf> {
 ///
 /// That is the one piece of enrollment state nothing writes until the device
 /// is registered, so an embedding application can ask it before importing a
-/// backup: an import over a registration already made here would replace it.
+/// backup or offering an enrollment: either one over a registration already
+/// made here would replace it.
+///
+/// It FAILS CLOSED. A directory that exists but cannot be read — owned by an id
+/// this process does not hold — answers `true`, because both callers act only
+/// on `false`, and acting on a registration nobody could read is the one wrong
+/// answer that destroys something. Only a missing or empty directory is "none".
 pub fn has_device_registration() -> bool {
-    rootless_persist_dir()
-        .map(|persist| non_empty_dir(&persist.join("state/identity-broker-etc")))
-        .unwrap_or(false)
+    let Ok(persist) = rootless_persist_dir() else {
+        return true;
+    };
+    registration_in(&persist.join("state/identity-broker-etc"))
+}
+
+fn registration_in(dir: &Path) -> bool {
+    match std::fs::read_dir(dir) {
+        Ok(mut entries) => entries.next().is_some(),
+        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+    }
 }
 
 /// `(persist subpath, archive member)` pairs. The archive layout matches the
@@ -242,4 +256,31 @@ pub fn restore_rootless(input: Option<&Path>) -> Result<()> {
     let _ = std::fs::remove_dir_all(&tmp);
     info!("Enrollment state restored. Bring the container up with: intune-container start");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A registration is "none" only when there is provably none: an unreadable
+    /// directory reads as present, so nobody imports or enrolls over it.
+    #[test]
+    fn a_registration_nobody_can_read_counts_as_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("ic-reg-{}", std::process::id()));
+        let dir = base.join("identity-broker-etc");
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(!registration_in(&dir), "missing is none");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!registration_in(&dir), "empty is none");
+        std::fs::write(dir.join("cert.pem"), b"x").unwrap();
+        assert!(registration_in(&dir), "a file is a registration");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // root reads it anyway; only an unprivileged run can see the refusal.
+        if std::fs::read_dir(&dir).is_err() {
+            assert!(registration_in(&dir), "unreadable fails closed");
+        }
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
