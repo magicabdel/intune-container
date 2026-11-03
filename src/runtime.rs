@@ -1588,7 +1588,10 @@ pub fn running_leader() -> Result<Option<i32>> {
 /// Whether `state` still describes a running container: its leader is a
 /// container init ([`is_running`]) and, where the state recorded one, it is the
 /// very process that was started.
-fn state_is_live(state: &RuntimeState) -> bool {
+///
+/// Public so a caller can judge a [`load_runtime_state`] answer without
+/// [`running_leader`]'s side effect of clearing stale state.
+pub fn state_is_live(state: &RuntimeState) -> bool {
     is_running(state.leader)
         && match state.start_time {
             Some(recorded) => process_start_time(state.leader) == Some(recorded),

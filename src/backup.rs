@@ -76,6 +76,18 @@ fn rootless_persist_dir() -> Result<PathBuf> {
     Ok(data_dir()?.join("persist"))
 }
 
+/// Whether this machine holds a device registration: the Workplace Join keys
+/// and certificate under `persist/state/identity-broker-etc`.
+///
+/// That is the one piece of enrollment state nothing writes until the device
+/// is registered, so an embedding application can ask it before importing a
+/// backup: an import over a registration already made here would replace it.
+pub fn has_device_registration() -> bool {
+    rootless_persist_dir()
+        .map(|persist| non_empty_dir(&persist.join("state/identity-broker-etc")))
+        .unwrap_or(false)
+}
+
 /// `(persist subpath, archive member)` pairs. The archive layout matches the
 /// nspawn backup (`device-state/...`, `home/...`) so backups are interchangeable
 /// between backends.

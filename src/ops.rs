@@ -277,6 +277,36 @@ pub fn portal_finish() -> Result<()> {
     auto_detach_after_gui(&mut config)
 }
 
+/// The container's own display, which every boot starts (see
+/// [`crate::provision::BROKER_DISPLAY_SCRIPT`]).
+pub const CONTAINER_DISPLAY: &str = ":99";
+
+/// Launch the Intune portal on the container's OWN display ([`CONTAINER_DISPLAY`]),
+/// with no host display attached and no restart.
+///
+/// For an embedding application that serves that display itself — teams-lite
+/// draws the portal's window into its own page to enroll a container that runs
+/// in a pod. Unlike [`portal_start`], nothing is stopped or restarted: the
+/// container stays in its headless profile, and the broker's own dialogs land on
+/// the same display, because `:99` is already what the session publishes to it.
+/// The container must be running. Close it with [`portal_stop`].
+pub fn portal_open_headless() -> Result<()> {
+    let config = config::Config::load().context("Not set up yet: initialize first")?;
+    if !backend::is_running(&config) {
+        anyhow::bail!("the container is not running");
+    }
+    backend::wait_until_portal_ready(&config);
+    info!("Starting the Intune portal on the container's own display.");
+    let display = display::DisplayInfo {
+        wayland_socket: None,
+        x11_display: Some(CONTAINER_DISPLAY.to_string()),
+        xauthority: None,
+        // Nothing to bind: the display is the container's own.
+        has_abstract_x11: true,
+    };
+    backend::exec(&config, "intune-portal", None, &display)
+}
+
 // ===== Edge =====
 
 /// Launch Microsoft Edge inside the container (a GUI flow: forwards the real
@@ -870,6 +900,33 @@ mod tests {
             body.contains("BROKER_DISPLAY_SCRIPT"),
             "portal_start must restore the broker's display before it returns"
         );
+    }
+
+    /// A headless portal is the one portal launch that must not touch the
+    /// container's lifecycle: its caller serves the display from a process that
+    /// is talking to the broker the whole time, and a restart would take the
+    /// broker down under it.
+    #[test]
+    fn the_headless_portal_never_restarts_the_container() {
+        let source = include_str!("ops.rs");
+        let start = source
+            .split("pub fn portal_open_headless")
+            .nth(1)
+            .expect("portal_open_headless exists");
+        let body = start.split("\n}\n").next().unwrap_or(start);
+        for restart in [
+            "ensure_running",
+            "attach_display",
+            "backend::stop",
+            "backend::start",
+        ] {
+            assert!(
+                !body.contains(restart),
+                "portal_open_headless calls {restart}"
+            );
+        }
+        assert!(body.contains("CONTAINER_DISPLAY"));
+        assert!(body.contains("wait_until_portal_ready"));
     }
 
     /// `portal_stop` has to outlive the portal it asks to close.

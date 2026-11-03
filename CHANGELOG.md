@@ -10,6 +10,16 @@ to follow [Semantic Versioning](https://semver.org/) once it reaches 1.0.
 - Boot inside a Docker container or a Kubernetes pod, with no systemd user
   session: `INTUNE_CONTAINER_CGROUP=own` makes the container's cgroup scope
   from a cgroup the entrypoint delegated (see docs/architecture.md)
+- Open the Intune portal on the container's own display, with no restart, for
+  an application that serves that display itself (`ops::portal_open_headless`)
+- Say whether this machine holds a device registration
+  (`backup::has_device_registration`), and judge a saved runtime state without
+  clearing it (`runtime::state_is_live`)
+
+### Changed
+- The container's own display is 1280x800 at 24 bits (was 640x480 at 16), so a
+  sign-in window or the portal drawn there keeps its desktop layout and can be
+  read by an X client that expects 32-bit pixels
 
 ### Fixed
 - Never release a half-made container when its id maps or its cgroup fail

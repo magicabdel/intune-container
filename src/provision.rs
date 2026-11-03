@@ -169,6 +169,12 @@ done"#,
 /// was killed, and the broker then failed with `cannot open display: :77` until
 /// somebody read the container's own journal.
 ///
+/// It is a desktop-size, 24-bit screen (1280x800x24) because something does draw on
+/// it: an embedding application can serve the broker's sign-in window or the
+/// portal from this display into its own page. Entra keeps its desktop layout only
+/// from about 1280x800 (see `login`), and a reader of a 16-bit visual needs a
+/// stride it rarely supports. The cost is a few megabytes of framebuffer.
+///
 /// It runs as a transient user unit with `Restart=always` rather than as a bare
 /// background process, because a child of the `setns` exec dies with that exec's
 /// cgroup. Run a second time — which is what a sign-in does on its way out —
@@ -179,8 +185,8 @@ if [ -n "$_xvfb" ]; then
         systemctl --user reset-failed intune-xvfb.service >/dev/null 2>&1 || true
         if ! systemd-run --user --unit=intune-xvfb --collect --quiet \
                 --property=Restart=always --property=RestartSec=1 \
-                "$_xvfb" :99 -screen 0 640x480x16 -nolisten tcp >/dev/null 2>&1; then
-            setsid "$_xvfb" :99 -screen 0 640x480x16 -nolisten tcp >/tmp/intune-xvfb.log 2>&1 &
+                "$_xvfb" :99 -screen 0 1280x800x24 -nolisten tcp >/dev/null 2>&1; then
+            setsid "$_xvfb" :99 -screen 0 1280x800x24 -nolisten tcp >/tmp/intune-xvfb.log 2>&1 &
         fi
     fi
     for _ in $(seq 1 20); do [ -S /tmp/.X11-unix/X99 ] && break; sleep 0.3; done
@@ -344,7 +350,7 @@ mod tests {
         assert!(s.contains("systemctl restart microsoft-identity-device-broker.service"));
         assert!(s.contains("intune-agent.timer"));
         assert!(s.contains("user@0.service"));
-        assert!(s.contains(":99 -screen 0 640x480x16"));
+        assert!(s.contains(":99 -screen 0 1280x800x24"));
         // Display-forwarded variant should NOT start Xvfb.
         assert!(!runtime_setup_script(&u, false).contains("Xvfb"));
     }
